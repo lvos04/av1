@@ -1,0 +1,22 @@
+[Unit]
+Description=AV1 Pipeline backend
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/av1-pipeline /library
+
+[Service]
+Type=simple
+User=av1pipeline
+Group=av1pipeline
+SupplementaryGroups=render video
+EnvironmentFile=/etc/av1-pipeline.env
+WorkingDirectory=__PROJECT_DIR__/backend
+ExecStart=__PROJECT_DIR__/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

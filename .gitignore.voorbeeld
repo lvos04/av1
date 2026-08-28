@@ -1,0 +1,12 @@
+testdata/
+cache/
+prullenbak/
+config/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+.venv/
+node_modules/
+.next/
+.env

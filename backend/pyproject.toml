@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "av1-pipeline-backend"
+version = "0.1.0"
+description = "Native, veilige AV1-pipeline voor één Ubuntu-host"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+  "pydantic>=2.11,<3",
+  "psutil>=7,<8",
+  "cryptography>=45,<47",
+  "httpx>=0.28,<1",
+  "python-multipart>=0.0.20,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.1,<2",
+  "pytest-cov>=6,<8",
+  "ruff>=0.12,<1",
+  "mypy>=1.17,<2",
+  "types-psutil>=7,<8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"app/media/*.py" = ["SIM105"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["app"]
