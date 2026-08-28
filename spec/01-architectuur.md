@@ -181,15 +181,16 @@ per-engine bezetting. De engine die telt bij AV1-encoden heet **Video**.
 
 ```
 /library/...                         je media, aangekoppeld zoals in Unmanic
-/srv/av1-pipeline/cache              1 TB SSD: encode-cache
-/srv/av1-pipeline/work               1 TB SSD: tijdelijke DV/VMAF-bestanden
-/srv/av1-pipeline/config             1 TB SSD: SQLite en logs
-/srv/av1-pipeline/backups            1 TB SSD: lokale, recente back-ups
+/srv/av1-pipeline/cache              systeemschijf: standaard encode-cache
+/srv/av1-pipeline/work               systeemschijf: standaard tijdelijk werk
+/srv/av1-pipeline/config             systeemschijf: vaste SQLite, logs en opslagkeuze
+/srv/av1-pipeline/backups            systeemschijf: standaard lokale herstelkopieën
+/mnt/av1-werkruimte/{cache,work}     optioneel later gemounte werkruimte via de UI
 ```
 
 De cache staat **buiten** `/library`. Een half afgemaakte encode mag nooit door
 Jellyfin gezien worden. Een geverifieerd resultaat vervangt het origineel met
 één atomische naamwissel op de bibliotheekschijf; het origineel wordt daarbij
-permanent verwijderd. Een lokale back-up op de SSD is nuttig voor snel herstel,
-maar is geen bescherming tegen defecte SSD; kopieer back-ups desgewenst naar
-een tweede locatie.
+permanent verwijderd. Een lokale back-up op dezelfde systeemschijf is nuttig
+voor snel databaseherstel, maar beschermt niet tegen schijfdefect; kopieer
+back-ups naar een tweede locatie.

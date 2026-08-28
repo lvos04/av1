@@ -1,30 +1,50 @@
 # Opslag, herstel en schakelaars
 
-De 1 TB-SSD is de snelle werkplek van de pipeline. Hij is niet de enige plek
-waarvan een kopie telt; vervangen originelen worden na verificatie permanent
-verwijderd.
+De host heeft standaard één 1-TB-systeemschijf. Ubuntu, SQLite, logs, cache en
+werkbestanden delen die schijf, maar de pipeline houdt daarop altijd een harde
+vrije-ruimtebodem vrij. Een later toegevoegde schijf kan in de UI als
+werkruimte worden gekozen nadat Ubuntu hem heeft gemount; formatteren en
+mounten blijven uitdrukkelijk beheerhandelingen buiten de pipeline.
 
-## Indeling van de 1 TB-SSD
+## Vaste control-plane en gekozen werkruimte
 
-Koppel de SSD vast aan `/srv/av1-pipeline` en geef de backendgebruiker toegang
-tot de vier submappen:
+`/srv/av1-pipeline/config` blijft altijd op de systeemschijf. Daardoor blijven
+de database, hersteltransacties en opslagpagina bereikbaar als een latere
+werkschijf ontbreekt. De standaardindeling is:
 
 | Map | Doel | Mag automatisch worden opgeruimd |
 |---|---|---|
-| `cache/` | resultaten tijdens encode | alleen afgebroken/mislukte tijdelijke output |
-| `work/` | DV-, VMAF- en proefdraaiwerk | ja, na een gecontroleerde job |
-| `config/` | SQLite, configuratie en logs | nee |
-| `backups/` | recente lokale back-ups | volgens de ingestelde bewaartermijn |
+| `/srv/av1-pipeline/cache/` | resultaten tijdens encode | alleen afgebroken/mislukte tijdelijke output |
+| `/srv/av1-pipeline/work/` | DV-, VMAF- en proefdraaiwerk | ja, na een gecontroleerde job |
+| `/srv/av1-pipeline/config/` | SQLite, opslagkeuze en logs | nee |
+| `/srv/av1-pipeline/backups/` | recente lokale herstelkopieën | volgens de ingestelde bewaartermijn |
 
 De planner reserveert vóór een job `CACHE_RESERVE_FACTOR` maal de brongrootte
-op de SSD en telt reserveringen van lopende CPU- en GPU-jobs bij elkaar op. Met
-1 TB is één CPU- en één GPU-job meestal realistisch; de instelling
-`MAX_ACTIVE_JOBS=2` is daarom de veilige start. Verhoog pas na metingen op
-jouw grootste bestanden.
+en telt reserveringen van lopende CPU- en GPU-jobs bij elkaar op. In
+systeemschijfmodus moet daar standaard nog minimaal 150 GB werkelijk vrij
+boven blijven; de UI kan die bodem verhogen, maar niet onder 150 GB brengen.
+Waarschuwen begint bij 250 GB. Met 1 TB
+is één CPU- en één GPU-job meestal realistisch; `MAX_ACTIVE_JOBS=2` blijft de
+veilige start.
+
+De pagina **Instellingen → Opslag kiezen** biedt twee modi:
+
+- **1-TB-systeemschijf:** cache en werk onder `/srv/av1-pipeline`, met de
+  niet-uitschakelbare systeembodem;
+- **aparte gemounte werkschijf:** cache en werk samen onder één gekozen,
+  bestaand mountpoint. Nieuwe back-ups mogen naar keuze op de systeemschijf of
+  die werkruimte komen.
+
+Een wissel pauzeert beide workers en kan alleen zonder actieve jobs,
+achtergrondproeven of achtergebleven cache-/werkbestanden. Het nieuwe pad moet
+een echt afzonderlijk filesystem zijn, mag geen symlink zijn, mag niet binnen
+`/library` liggen en moet eigendom van de backendgebruiker zijn. De UI voert
+eerst een droge controle uit, schrijft de keuze atomisch naar
+`config/opslag.json` en raakt geen partitie- of mountconfiguratie aan.
 
 ## Vervangen en herstel
 
-1. Encodeer uitsluitend naar de SSD-cache.
+1. Encodeer uitsluitend naar de gekozen cache.
 2. Verifieer daar het resultaat.
 3. Leg een `vervang_transactie` vast en kopieer het resultaat als verborgen
    tijdelijk bestand naar de doelmap op de mediavolume.
@@ -67,7 +87,8 @@ hersteltransacties. Ze beschermen gegevens en blijven actief.
 ## Back-up en toegang
 
 Automatische back-ups bevatten SQLite, de niet-geheime configuratie en een
-hashmanifest. De geheime sleutel staat apart in
+hashmanifest. Op dezelfde systeemschijf zijn dit herstelkopieën tegen een
+databasefout, geen bescherming tegen fysiek schijfdefect. De geheime sleutel staat apart in
 `/etc/av1-pipeline-secrets.key`; maak daarvan een versleutelde offline kopie.
 De UI biedt een **herstelcontrole** die een back-up naar een tijdelijke SQLite-
 database kopieert en opent, zonder de werkende database te wijzigen.

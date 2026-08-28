@@ -15,6 +15,7 @@ import psutil
 
 from app.config import Settings
 from app.db import Database
+from app.opslag import storage_validation_error
 
 
 def _temperature() -> float | None:
@@ -47,8 +48,22 @@ def mount_report(settings: Settings) -> dict[str, Any]:
             "schrijfbaar": exists and os.access(path, os.W_OK | os.X_OK),
         }
 
+    pipeline = details(settings.pipeline_root)
+    workspace = details(settings.workspace_root)
+    pipeline["schrijfbaar"] = all(
+        path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+        for path in (settings.config_root, settings.backup_root)
+        if path.is_relative_to(settings.pipeline_root)
+    )
+    workspace["schrijfbaar"] = all(
+        path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+        for path in (settings.cache_root, settings.work_root)
+    )
+    workspace["modus"] = settings.storage_mode
+    workspace["systeemschijf_reserve_gb"] = settings.system_disk_reserve_gb
     return {
-        "project_ssd": details(settings.pipeline_root),
+        "pipeline_opslag": pipeline,
+        "werkruimte": workspace,
         "library_root": details(settings.library_root),
         "cache": details(settings.cache_root),
     }
@@ -201,7 +216,13 @@ def _gpu_values(payload: dict[str, Any]) -> dict[str, Any]:
 def system_metrics(
     database: Database, settings: Settings, gpu_monitor: GpuMonitor
 ) -> dict[str, Any]:
-    usage = shutil.disk_usage(settings.cache_root)
+    storage_error = storage_validation_error(settings)
+    try:
+        usage = shutil.disk_usage(settings.cache_root)
+        free = usage.free
+    except OSError as exc:
+        free = 0
+        storage_error = str(exc)
     reserved_row = database.fetch_one(
         "SELECT COALESCE(SUM(cache_reservering),0) AS bytes FROM job "
         "WHERE status IN ('bezig','verifieren')"
@@ -210,23 +231,33 @@ def system_metrics(
     limits = database.fetch_one(
         "SELECT cache_waarschuwing_gb,cache_pauze_gb FROM instelling WHERE id=1"
     )
-    warning = int(limits["cache_waarschuwing_gb"]) if limits is not None else 50
-    pause = int(limits["cache_pauze_gb"]) if limits is not None else 10
-    free_gb = usage.free / 1024**3
+    warning = int(limits["cache_waarschuwing_gb"]) if limits is not None else 250
+    pause = int(limits["cache_pauze_gb"]) if limits is not None else 150
+    effective_warning, effective_pause = settings.effective_cache_limits(warning, pause)
+    free_gb = free / 1024**3
     cache_status = (
-        "pauzegrens" if free_gb < pause else "waarschuwing" if free_gb < warning else "voldoende"
+        "pauzegrens"
+        if free_gb < effective_pause
+        else "waarschuwing"
+        if free_gb < effective_warning
+        else "voldoende"
     )
     return {
         "cpu_percent": psutil.cpu_percent(interval=None),
         "cpu_temp": _temperature(),
         "gpu": dict(gpu_monitor.latest),
-        "schijf_vrij_gb": round(usage.free / 1024**3, 2),
-        "schijf_vrij_bytes": usage.free,
+        "schijf_vrij_gb": round(free / 1024**3, 2),
+        "schijf_vrij_bytes": free,
         "schijf_gereserveerd_bytes": reserved,
-        "schijf_beschikbaar_na_reservering": max(0, usage.free - reserved),
+        "schijf_beschikbaar_na_reservering": max(0, free - reserved),
         "cache_status": cache_status,
         "cache_waarschuwing_gb": warning,
         "cache_pauze_gb": pause,
+        "effectieve_cache_waarschuwing_gb": effective_warning,
+        "effectieve_cache_pauze_gb": effective_pause,
+        "opslagmodus": settings.storage_mode,
+        "systeemschijf_reserve_gb": settings.system_disk_reserve_gb,
+        "opslagfout": storage_error,
     }
 
 

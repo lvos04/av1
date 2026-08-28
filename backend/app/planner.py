@@ -205,14 +205,22 @@ class Planner:
                 ).fetchone()[0]
             )
             setting = connection.execute(
-                "SELECT cache_pauze_gb FROM instelling WHERE id=1"
+                "SELECT cache_waarschuwing_gb,cache_pauze_gb FROM instelling WHERE id=1"
             ).fetchone()
-            pause_bytes = int(setting[0]) * 1024**3 if setting is not None else 10 * 1024**3
+            warning_gb = int(setting[0]) if setting is not None else 250
+            pause_gb = int(setting[1]) if setting is not None else 150
+            _effective_warning, effective_pause = self.settings.effective_cache_limits(
+                warning_gb, pause_gb
+            )
+            pause_bytes = effective_pause * 1024**3
             free = shutil.disk_usage(self.settings.cache_root).free
             if free - reserved - reserve < pause_bytes:
                 connection.execute(
                     "UPDATE job SET fout=? WHERE id=?",
-                    ("wacht op voldoende gereserveerde cacheruimte", int(row["id"])),
+                    (
+                        "wacht op voldoende cacheruimte boven de vaste schijfbodem",
+                        int(row["id"]),
+                    ),
                 )
                 connection.commit()
                 return None, "onvoldoende vrije, niet-gereserveerde cacheruimte"

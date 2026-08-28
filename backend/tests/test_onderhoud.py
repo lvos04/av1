@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,7 @@ def _case(tmp_path: Path) -> tuple[Database, Settings, int]:
         config_root=roots["config"],
         backup_root=roots["backups"],
         database_path=roots["config"] / "app.db",
+        storage_mode="aparte_schijf",
     )
     database = Database(configured)
     database.initialize()
@@ -98,6 +100,19 @@ def test_cachegrenzen_pauzeren_en_herstellen_alleen_eigen_pauze(tmp_path: Path) 
     database.execute("UPDATE instelling SET cache_waarschuwing_gb=1,cache_pauze_gb=1")
     storage_guard(database, configured)
     assert not any(
+        row["gepauzeerd"] for row in database.fetch_all("SELECT gepauzeerd FROM worker_config")
+    )
+
+
+def test_ontbrekende_latere_werkruimte_pauzeert_zonder_crash(tmp_path: Path) -> None:
+    database, configured, _job_id = _case(tmp_path)
+    shutil.rmtree(configured.cache_root)
+
+    result = storage_guard(database, configured)
+
+    assert result["vrij_bytes"] == 0
+    assert "gepauzeerd" in str(result["status"])
+    assert all(
         row["gepauzeerd"] for row in database.fetch_all("SELECT gepauzeerd FROM worker_config")
     )
 

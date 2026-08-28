@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.db import Database
 
 MAX_DB_LOG_LINES = 500
 MAX_SUCCESS_LOG_LINES = 200
+LOGGER = logging.getLogger(__name__)
 
 
 def append_job_log(database: Database, job_id: int, level: str, text: str) -> None:
@@ -109,19 +111,30 @@ def rotate_logs(
 
 
 def storage_guard(database: Database, settings: Settings) -> dict[str, int | str]:
-    free = shutil.disk_usage(settings.cache_root).free
+    try:
+        free = shutil.disk_usage(settings.cache_root).free
+    except OSError as exc:
+        database.execute(
+            "UPDATE worker_config SET gepauzeerd=1,pauze_reden=?",
+            (f"automatisch: opslag niet bereikbaar: {exc}",),
+        )
+        return {"vrij_bytes": 0, "status": f"automatisch gepauzeerd: {exc}"}
     row = database.fetch_one(
         "SELECT cache_waarschuwing_gb,cache_pauze_gb FROM instelling WHERE id=1"
     )
-    warning = int(row["cache_waarschuwing_gb"]) * 1024**3 if row else 50 * 1024**3
-    pause = int(row["cache_pauze_gb"]) * 1024**3 if row else 10 * 1024**3
+    warning_gb = int(row["cache_waarschuwing_gb"]) if row else 250
+    pause_gb = int(row["cache_pauze_gb"]) if row else 150
+    effective_warning, effective_pause = settings.effective_cache_limits(warning_gb, pause_gb)
+    warning = effective_warning * 1024**3
+    pause = effective_pause * 1024**3
     status = "voldoende"
     if free < pause:
-        status = "automatisch gepauzeerd: cache onder pauzegrens"
+        status = "automatisch gepauzeerd: opslag onder veilige vrije-ruimtebodem"
         database.execute(
             """
             UPDATE worker_config SET gepauzeerd=1,pauze_reden=?
             WHERE gepauzeerd=0 OR pauze_reden LIKE 'automatisch: cache%'
+               OR pauze_reden LIKE 'automatisch: opslag%'
             """,
             (f"automatisch: cache heeft nog {free / 1024**3:.1f} GB vrij",),
         )
@@ -131,6 +144,7 @@ def storage_guard(database: Database, settings: Settings) -> dict[str, int | str
             """
             UPDATE worker_config SET gepauzeerd=0,pauze_reden=NULL
             WHERE pauze_reden LIKE 'automatisch: cache%'
+               OR pauze_reden LIKE 'automatisch: opslag%'
             """
         )
     else:
@@ -138,6 +152,7 @@ def storage_guard(database: Database, settings: Settings) -> dict[str, int | str
             """
             UPDATE worker_config SET gepauzeerd=0,pauze_reden=NULL
             WHERE pauze_reden LIKE 'automatisch: cache%'
+               OR pauze_reden LIKE 'automatisch: opslag%'
             """
         )
     return {"vrij_bytes": free, "status": status}
@@ -211,5 +226,10 @@ def run_maintenance(database: Database, settings: Settings) -> None:
 
 async def maintenance_loop(database: Database, settings: Settings) -> None:
     while True:
-        await asyncio.to_thread(run_maintenance, database, settings)
+        try:
+            await asyncio.to_thread(run_maintenance, database, settings)
+        except Exception:
+            # Onderhoud mag de uurcyclus niet permanent verliezen door een
+            # tijdelijk ontbrekende werkschijf of defecte back-upbestemming.
+            LOGGER.exception("Onderhoudscyclus mislukt; volgende uur opnieuw")
         await asyncio.sleep(3600)

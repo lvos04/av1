@@ -53,7 +53,7 @@ alles daarna bouwt hierop.
 | `spec/05-ui.md` | alle schermen, plus aanbevolen toevoegingen |
 | `spec/06-dolby-vision.md` | wat er met DV gebeurt, en wat er onzeker aan is |
 | `spec/07-bediening-en-beheer.md` | instellingen, kwaliteit, herstel en veilige koppelingen |
-| `spec/08-opslag-herstel-en-schakelaars.md` | 1 TB-SSD, crashherstel en alle aan/uit-opties |
+| `spec/08-opslag-herstel-en-schakelaars.md` | systeemschijf/werkruimte, crashherstel en alle aan/uit-opties |
 | `spec/09-figma-afstemming.md` | koppeling met het Figma-ontwerp en verplichte verschillen |
 | `prompts/00` t/m `11` | de bouwfasen, op volgorde |
 | `startcode/` | vijf modules die al werken en getest zijn |
@@ -99,7 +99,7 @@ veiligheidscorrecties die in het huidige ontwerp nog niet overal staan.
 | 8 | Extra's | 3-5 | VMAF, proefdraai en *arr |
 | 9 | Hardening | 3-4 | weken achter elkaar draaien |
 | 10 | Beheer en integraties | 4-6 | alle beheerfuncties, veilig afgerond |
-| 11 | SSD, herstel en schakelaars | 5-8 | crashveilig en makkelijk aan/uit te zetten |
+| 11 | Opslag, herstel en schakelaars | 5-8 | single-diskveilig, uitbreidbaar en crashbestendig |
 
 ---
 

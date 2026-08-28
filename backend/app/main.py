@@ -12,13 +12,14 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api import create_api_router
-from app.config import Settings, settings
+from app.config import ConfigError, Settings, settings
 from app.db import Database
 from app.health import dependency_report
 from app.integraties import IntegrationMonitor
 from app.live import register_websocket
 from app.media.beslissen import STANDAARD
 from app.onderhoud import maintenance_loop
+from app.opslag import storage_validation_error
 from app.planner import Planner
 from app.systeem import GpuMonitor
 from app.vervanging import recover_replacements
@@ -46,9 +47,22 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        storage_error: str | None = None
         if validate_storage:
-            app_settings.validate_storage()
+            try:
+                app_settings.validate_storage()
+            except ConfigError as exc:
+                # De kleine controledatabase blijft op de systeemschijf bereikbaar,
+                # zodat een ontbrekende latere werkschijf via de UI kan worden hersteld.
+                storage_error = str(exc)
+                LOGGER.error("Opslag niet gereed; workers blijven gepauzeerd: %s", exc)
         database.initialize()
+        application.state.storage_error = storage_error
+        if storage_error is not None:
+            database.execute(
+                "UPDATE worker_config SET gepauzeerd=1,pauze_reden=?",
+                (f"opslag niet gereed: {storage_error}",),
+            )
         _ensure_default_profile(database)
         recovery = recover_replacements(database, app_settings)
         if recovery:
@@ -94,6 +108,7 @@ def create_app(
     application.state.planner = Planner(database, app_settings)
     application.state.integration_monitor = IntegrationMonitor(database, app_settings)
     application.state.background_tasks = {}
+    application.state.storage_error = None
     application.include_router(create_api_router())
     register_websocket(application)
 
@@ -101,10 +116,20 @@ def create_app(
     async def root_health() -> dict[str, object]:
         dependencies = await dependency_report()
         database_ok = database.reachable()
+        application.state.storage_error = storage_validation_error(app_settings)
         return {
-            "status": ("ok" if database_ok and dependencies["media_stack_gereed"] else "degraded"),
+            "status": (
+                "ok"
+                if database_ok
+                and dependencies["media_stack_gereed"]
+                and application.state.storage_error is None
+                else "degraded"
+            ),
             "versie": __version__,
             "database": "ok" if database_ok else "fout",
+            "opslag": (
+                "ok" if application.state.storage_error is None else application.state.storage_error
+            ),
             "dependencies": dependencies,
         }
 

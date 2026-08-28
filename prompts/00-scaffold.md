@@ -58,9 +58,10 @@ testdata/              (gegenereerd, in .gitignore)
 - Maak een eerste migratie voor de algemene instellingen en bewaar geheime
   integratiesleutels alleen versleuteld. De sleutel om ze te ontsleutelen komt
   uit een root-leesbaar bestand buiten de repository, niet uit de database.
-- Lees de 1 TB-SSD uitsluitend via `PIPELINE_ROOT` en maak daar `cache`,
-  `work`, `config` en `backups`. Bij start controleer je dat dit een echt
-  mountpoint is; maak nooit stilzwijgend een gewone map op de systeemschijf.
+- Houd `config` en SQLite vast onder `PIPELINE_ROOT` op de systeemschijf. Zet
+  `cache`, `work` en standaard `backups` daar ook neer, met een harde vrije-
+  ruimtebodem. Ondersteun later een vooraf gemounte afzonderlijke werkruimte
+  via één gevalideerde opslagkeuze; formatteer of mount nooit automatisch.
 - Maak de migraties voor `functie`, `vervang_transactie`, `auditlog` en
   `backup_status` meteen aan, ook als de bijbehorende opties nog uit staan.
 
@@ -76,8 +77,8 @@ Docker, geen Compose en geen container-entrypoint.
   systeem-Python.
 - Maak twee systemd-units: één voor Uvicorn/FastAPI en één voor de Next.js
   frontend. Laat beide bij boot starten en bij een fout herstarten.
-- De backend draait als `av1pipeline`; geef de frontend geen toegang tot de
-  bibliotheek of de project-SSD.
+- De backend draait als `av1pipeline`; geef de frontend geen rechtstreekse
+  toegang tot bibliotheek of opslagmappen.
 - Gebruik de absolute paden uit `/etc/av1-pipeline.env`: `/library` en
   `/srv/av1-pipeline/{cache,work,config,backups}`.
   De cache staat buiten `/library`.

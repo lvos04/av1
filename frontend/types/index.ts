@@ -43,6 +43,11 @@ export interface SystemMetrics {
   cache_status: "voldoende" | "waarschuwing" | "pauzegrens";
   cache_waarschuwing_gb: number;
   cache_pauze_gb: number;
+  effectieve_cache_waarschuwing_gb: number;
+  effectieve_cache_pauze_gb: number;
+  opslagmodus: "systeemschijf" | "aparte_schijf";
+  systeemschijf_reserve_gb: number;
+  opslagfout: string | null;
 }
 
 export interface QueueCounts {

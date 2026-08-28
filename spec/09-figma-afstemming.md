@@ -21,8 +21,8 @@ zijn echter leidend. Bij een verschil gaan `04-veiligheidsregels.md`,
   Profielen, Kwaliteit, Logs, Fouten en Instellingen.
 - Instellingen bevat een onderdeel **Onderdelen** met de schakelbare opties uit
   `08-opslag-herstel-en-schakelaars.md`.
-- Dashboard en systeemstatus tonen de project-SSD op
-  `/srv/av1-pipeline`: vrije ruimte, gereserveerde ruimte, mountstatus en
+- Dashboard en systeemstatus tonen de gekozen werkopslag: vrije ruimte,
+  gereserveerde ruimte, systeemschijfbodem, mountstatus en
   actieve cachejobs.
 - Voeg statusweergave toe voor canary-limiet, hersteltransacties, back-ups,
   behoud van bestandsmetadata en QSV-diagnostiek.
@@ -31,7 +31,7 @@ zijn echter leidend. Bij een verschil gaan `04-veiligheidsregels.md`,
 
 1. Werk eerst de vaste navigatie en foutieve/onveilige teksten bij.
 2. Maak vervolgens Workers, Kwaliteit en Instellingen → Onderdelen.
-3. Voeg SSD-, herstel-, canary- en back-upstatus toe aan Dashboard en Fouten.
+3. Voeg opslag-, herstel-, canary- en back-upstatus toe aan Dashboard en Fouten.
 4. Gebruik pas daarna microcopy en visuele verfijning.
 
 De frontend mag nooit functionaliteit suggereren die de backend niet kan

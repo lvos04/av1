@@ -47,12 +47,13 @@ Instellingen aanpasbaar. Bewaak ook een optionele Jellyfin-controle: zodra er
 een actieve afspeelsessie is, pauzeert alleen de CPU-baan; de GPU-baan gaat
 door tenzij de gebruiker hem zelf pauzeert.
 
-**SSD-reservering:** reken niet alleen met vrije ruimte. Reserveer atomisch
+**Opslagreservering:** reken niet alleen met vrije ruimte. Reserveer atomisch
 `CACHE_RESERVE_FACTOR × bron_grootte` voor iedere actieve job in de database
-en tel bestaande reserveringen mee. Met de eigen 1 TB-SSD is standaard één
-CPU- en één GPU-job (`MAX_ACTIVE_JOBS=2`) toegestaan. Ontbreekt de SSD-mount,
-is hij niet schrijfbaar of is de reserve niet beschikbaar, dan blijft de job
-wachten met de reden in de UI.
+en tel bestaande reserveringen mee. Op de 1-TB-systeemschijf blijft daarnaast
+altijd de vaste OS-bodem vrij. Standaard is één CPU- en één GPU-job
+(`MAX_ACTIVE_JOBS=2`) toegestaan. Ontbreekt een later gekozen werkschijfmount,
+is opslag niet schrijfbaar of is de reserve niet beschikbaar, dan blijft de
+job wachten met de reden in de UI.
 
 **CLI en API:**
 

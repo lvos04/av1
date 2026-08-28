@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -61,6 +61,29 @@ interface Recovery {
   gewijzigd_op: string;
 }
 
+interface StorageState {
+  modus: "systeemschijf" | "aparte_schijf";
+  pipeline_pad: string;
+  werkruimte_pad: string;
+  cache_pad: string;
+  werk_pad: string;
+  config_pad: string;
+  backup_pad: string;
+  backups_op: "systeemschijf" | "werkruimte";
+  systeemschijf_reserve_gb: number;
+  werkruimte_mountpoint: boolean;
+  werkruimte_op_systeemschijf: boolean;
+  vrij_bytes: number;
+  totaal_bytes: number;
+  cache_inhoud: { bestanden: number; mappen: number; bytes: number };
+  werk_inhoud: { bestanden: number; mappen: number; bytes: number };
+  kan_wisselen: boolean;
+  actieve_jobs: number;
+  achtergrondtaken: number;
+  opslagfout: string | null;
+  uitleg: string;
+}
+
 const confirmations: Record<string, { enabled: boolean; text: string }> = {
   externe_toegang: { enabled: true, text: "LAN-TOEGANG INSCHAKELEN" },
   hardlink_verbreken: { enabled: true, text: "HARDLINKS VERBREKEN" },
@@ -75,21 +98,27 @@ export default function SettingsPage() {
   const [backups, setBackups] = useState<Backup[]>([]);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [recovery, setRecovery] = useState<Recovery[]>([]);
+  const [storage, setStorage] = useState<StorageState | null>(null);
+  const [storageMode, setStorageMode] = useState<StorageState["modus"]>("systeemschijf");
   const [message, setMessage] = useState("");
+  const storageForm = useRef<HTMLFormElement>(null);
 
   const load = useCallback(async () => {
-    const [loadedSettings, loadedFeatures, loadedIntegrations, loadedBackups, loadedRecovery] = await Promise.all([
+    const [loadedSettings, loadedFeatures, loadedIntegrations, loadedBackups, loadedRecovery, loadedStorage] = await Promise.all([
       api<Settings>("/instellingen"),
       api<Feature[]>("/functies"),
       api<Integration[]>("/integraties"),
       api<Backup[]>("/backups"),
       api<Recovery[]>("/herstel"),
+      api<StorageState>("/opslag"),
     ]);
     setSettings(loadedSettings);
     setFeatures(loadedFeatures);
     setIntegrations(loadedIntegrations);
     setBackups(loadedBackups);
     setRecovery(loadedRecovery);
+    setStorage(loadedStorage);
+    setStorageMode(loadedStorage.modus);
   }, []);
 
   useEffect(() => { load().catch((error: unknown) => setMessage(String(error))); }, [load]);
@@ -113,6 +142,44 @@ export default function SettingsPage() {
       });
       setSettings(result);
       setMessage("Instellingen server-side gevalideerd en opgeslagen.");
+    } catch (error) { setMessage(String(error)); }
+  }
+
+  function storagePayload(form: HTMLFormElement) {
+    const data = new FormData(form);
+    return {
+      modus: storageMode,
+      werkruimte_pad: storageMode === "systeemschijf"
+        ? storage?.pipeline_pad ?? "/srv/av1-pipeline"
+        : String(data.get("werkruimte_pad") ?? ""),
+      backups_op: String(data.get("backups_op")),
+      systeemschijf_reserve_gb: Number(data.get("systeemschijf_reserve_gb")),
+    };
+  }
+
+  async function checkStorage() {
+    if (!storageForm.current) return;
+    try {
+      const result = await mutation<Record<string, unknown>>(
+        "/opslag/controle",
+        "POST",
+        storagePayload(storageForm.current),
+      );
+      setMessage(`Opslagcontrole geslaagd: ${JSON.stringify(result)}`);
+    } catch (error) { setMessage(String(error)); }
+  }
+
+  async function applyStorage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const confirmation = window.prompt("Typ exact: OPSLAG WIJZIGEN");
+    if (confirmation === null) return;
+    try {
+      await mutation<StorageState>("/opslag", "PATCH", {
+        ...storagePayload(event.currentTarget),
+        bevestiging: confirmation,
+      });
+      await load();
+      setMessage("Opslag gewijzigd. Controleer de paden en hervat daarna beide workers.");
     } catch (error) { setMessage(String(error)); }
   }
 
@@ -174,14 +241,20 @@ export default function SettingsPage() {
   if (!settings) return <Card className="empty-state">Instellingen worden geladen…</Card>;
   return <div className="page-stack">
     {message ? <Card className="notice" role="status">{message}</Card> : null}
-    <form onSubmit={saveSettings}><Card className="settings-card"><div className="worker-header"><div><h2>Algemeen en grenzen</h2><span className="muted">Bedieningswaarden in SQLite; vaste paden blijven in de systemd-omgeving.</span></div><Button type="submit">Opslaan</Button></div><div className="settings-grid">
+    {storage ? <form ref={storageForm} onSubmit={applyStorage}><Card className="settings-card"><div className="worker-header"><div><h2>Opslag kiezen</h2><span className="muted">Cache en werkruimte kunnen later samen naar een echte extra mount. De kleine database en configuratie blijven altijd op de systeemschijf.</span></div><Badge tone={storage.opslagfout ? "red" : "green"}>{storage.opslagfout ? "opslagfout" : "veilig actief"}</Badge></div><div className="settings-grid">
+      <Field label="Werkopslag"><select name="modus" value={storageMode} onChange={(event) => setStorageMode(event.target.value as StorageState["modus"])}><option value="systeemschijf">1-TB-systeemschijf</option><option value="aparte_schijf">aparte gemounte werkschijf</option></select></Field>
+      <Field label="Mountpad extra werkschijf"><input name="werkruimte_pad" defaultValue={storage.modus === "aparte_schijf" ? storage.werkruimte_pad : "/mnt/av1-werkruimte"} disabled={storageMode === "systeemschijf"} placeholder="/mnt/av1-werkruimte" /></Field>
+      <Field label="Nieuwe back-ups"><select name="backups_op" defaultValue={storage.backups_op}><option value="systeemschijf">systeemschijf</option><option value="werkruimte">gekozen werkruimte</option></select></Field>
+      <Field label="Vaste systeemreserve (GB)"><input name="systeemschijf_reserve_gb" type="number" min="150" max="500" defaultValue={storage.systeemschijf_reserve_gb} /></Field>
+    </div><div className="decision-actions"><Button type="button" variant="secondary" onClick={checkStorage}>Controleer keuze</Button><Button type="submit">Pas opslag veilig toe</Button></div><p className="muted">{storage.uitleg}</p><p className="mono muted">Cache: {storage.cache_pad}<br />Werk: {storage.werk_pad}<br />Configuratie: {storage.config_pad}<br />Back-ups: {storage.backup_pad}</p><p className="muted">{bytes(storage.vrij_bytes)} vrij van {bytes(storage.totaal_bytes)} · cache {bytes(storage.cache_inhoud.bytes)} · werk {bytes(storage.werk_inhoud.bytes)} · {storage.actieve_jobs} actieve jobs. Wisselen kan alleen met lege cache/werkmap en zonder achtergrondtaak. De UI mount of formatteert nooit een schijf.</p>{storage.opslagfout ? <p className="danger">{storage.opslagfout}</p> : null}</Card></form> : null}
+    <form onSubmit={saveSettings}><Card className="settings-card"><div className="worker-header"><div><h2>Algemeen en grenzen</h2><span className="muted">Bedieningswaarden in SQLite; opslagpaden beheer je hierboven als één gecontroleerde indeling.</span></div><Button type="submit">Opslaan</Button></div><div className="settings-grid">
       <Field label="Servernaam"><input name="server_naam" defaultValue={settings.server_naam} required /></Field>
       <Field label="Tijdzone"><input name="tijdzone" defaultValue={settings.tijdzone} required /></Field>
       <Field label="Logniveau"><select name="log_niveau" defaultValue={settings.log_niveau}><option>debug</option><option>info</option><option>warning</option><option>error</option></select></Field>
       <Field label="CPU-limiet (%)"><input name="cpu_max_percent" type="number" min="10" max="100" defaultValue={settings.cpu_max_percent} /></Field>
       <Field label="Temperatuurgrens (°C)"><input name="cpu_max_temperatuur" type="number" min="40" max="110" defaultValue={settings.cpu_max_temperatuur} /></Field>
       <Field label="Cachewaarschuwing (GB)"><input name="cache_waarschuwing_gb" type="number" min="2" defaultValue={settings.cache_waarschuwing_gb} /></Field>
-      <Field label="Cachepauze (GB)"><input name="cache_pauze_gb" type="number" min="1" defaultValue={settings.cache_pauze_gb} /></Field>
+      <Field label="Cachepauze (GB)"><input name="cache_pauze_gb" type="number" min={storage?.modus === "systeemschijf" ? storage.systeemschijf_reserve_gb : 1} defaultValue={settings.cache_pauze_gb} /></Field>
       <Field label="Hardlinkbeleid"><select name="hardlink_modus" defaultValue={settings.hardlink_modus}><option value="overslaan">altijd overslaan</option><option value="verbreek_na_bevestiging">verbreek na bevestiging</option></select></Field>
       <label className="toggle-row"><input name="pauzeer_cpu_bij_kijken" type="checkbox" defaultChecked={settings.pauzeer_cpu_bij_kijken} /><span>CPU pauzeren bij Jellyfin-afspelen</span></label>
       <label className="toggle-row"><input name="meld_browser_fouten" type="checkbox" defaultChecked={settings.meld_browser_fouten} /><span>Browsermelding bij fouten</span></label>

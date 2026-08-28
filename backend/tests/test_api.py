@@ -20,7 +20,9 @@ from app.systeem import GpuMonitor
 
 @pytest.fixture
 def api_case(tmp_path: Path) -> Iterator[tuple[TestClient, Database, Settings, Path]]:
-    roots = {name: tmp_path / name for name in ("cache", "work", "config", "backups")}
+    pipeline = tmp_path / "pipeline"
+    pipeline.mkdir()
+    roots = {name: pipeline / name for name in ("cache", "work", "config", "backups")}
     for path in roots.values():
         path.mkdir()
     library_root = tmp_path / "library"
@@ -30,13 +32,18 @@ def api_case(tmp_path: Path) -> Iterator[tuple[TestClient, Database, Settings, P
     configured = replace(
         settings,
         library_root=library_root,
-        pipeline_root=tmp_path,
+        pipeline_root=pipeline,
+        workspace_root=pipeline,
         cache_root=roots["cache"],
         work_root=roots["work"],
         config_root=roots["config"],
         backup_root=roots["backups"],
         database_path=roots["config"] / "app.db",
         secret_key_file=roots["config"] / "secret.key",
+        storage_config_path=roots["config"] / "opslag.json",
+        storage_mode="systeemschijf",
+        backup_location="systeemschijf",
+        system_device=pipeline.stat().st_dev,
     )
     configured.secret_key_file.write_bytes(b"api-test-sleutelmateriaal" * 4)
     database = Database(configured)
@@ -76,6 +83,8 @@ def test_openapi_bevat_alle_fase_vijf_routes(
         "/api/fouten",
         "/api/statistieken",
         "/api/instellingen",
+        "/api/opslag",
+        "/api/opslag/controle",
         "/api/functies",
         "/api/systeem/qsv-test",
         "/api/systeem/diagnose",
@@ -361,3 +370,50 @@ def test_cachegrenzen_worden_ook_bij_een_enkele_wijziging_gevalideerd(
     client, _database, _configured, _media = api_case
     response = client.patch("/api/instellingen", json={"cache_pauze_gb": 50})
     assert response.status_code == 422
+
+
+def test_opslagkeuze_wordt_gecontroleerd_en_atomisch_bewaard(
+    api_case: tuple[TestClient, Database, Settings, Path],
+) -> None:
+    client, database, configured, _media = api_case
+    current = client.get("/api/opslag")
+    assert current.status_code == 200
+    assert current.json()["modus"] == "systeemschijf"
+    assert current.json()["systeemschijf_reserve_gb"] == 150
+
+    choice = {
+        "modus": "systeemschijf",
+        "werkruimte_pad": str(configured.pipeline_root),
+        "backups_op": "systeemschijf",
+        "systeemschijf_reserve_gb": 175,
+    }
+    checked = client.post("/api/opslag/controle", json=choice)
+    assert checked.status_code == 200, checked.text
+    assert checked.json()["controle"] == "veilig toepasbaar"
+
+    refused = client.patch("/api/opslag", json={**choice, "bevestiging": "bijna"})
+    assert refused.status_code == 409
+    applied = client.patch("/api/opslag", json={**choice, "bevestiging": "OPSLAG WIJZIGEN"})
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["systeemschijf_reserve_gb"] == 175
+    assert configured.storage_config_path.is_file()
+    assert '"systeemschijf_reserve_gb": 175' in configured.storage_config_path.read_text()
+    assert all(
+        row["gepauzeerd"] for row in database.fetch_all("SELECT gepauzeerd FROM worker_config")
+    )
+
+
+def test_health_wordt_direct_degraded_als_werkopslag_verdwijnt(
+    api_case: tuple[TestClient, Database, Settings, Path],
+) -> None:
+    client, _database, configured, _media = api_case
+    shutil.rmtree(configured.cache_root)
+
+    api_health = client.get("/api/health")
+    root_health = client.get("/health")
+    storage = client.get("/api/opslag")
+
+    assert api_health.status_code == 200
+    assert api_health.json()["status"] == "degraded"
+    assert root_health.json()["status"] == "degraded"
+    assert "ontbreekt" in str(storage.json()["opslagfout"])

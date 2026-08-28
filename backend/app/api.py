@@ -30,6 +30,15 @@ from app.kwaliteit import (
     vmaf_available,
 )
 from app.media.beslissen import STANDAARD, Besluit, beslis
+from app.opslag import (
+    StorageChangeError,
+    build_storage_candidate,
+    persist_storage,
+    prepare_storage,
+    storage_report,
+    storage_validation_error,
+    transient_storage_is_empty,
+)
 from app.scanner import ScanError, scan_library
 from app.systeem import GpuMonitor, mount_report, qsv_test, system_metrics
 from app.uitvoerder import ExecutionError, create_job_from_decision
@@ -123,6 +132,17 @@ class SettingsPatch(StrictModel):
     meld_browser_fouten: bool | None = None
     meld_browser_batches: bool | None = None
     pauzeer_cpu_bij_kijken: bool | None = None
+
+
+class StorageChoice(StrictModel):
+    modus: Literal["systeemschijf", "aparte_schijf"]
+    werkruimte_pad: str
+    backups_op: Literal["systeemschijf", "werkruimte"]
+    systeemschijf_reserve_gb: int = Field(ge=150, le=500)
+
+
+class StorageApply(StorageChoice):
+    bevestiging: str
 
 
 class FeaturePatch(StrictModel):
@@ -305,10 +325,20 @@ def create_api_router() -> APIRouter:
         database = _database(request)
         dependencies = await dependency_report()
         database_ok = database.reachable()
+        request.app.state.storage_error = storage_validation_error(_settings(request))
         return {
-            "status": "ok" if database_ok and dependencies["media_stack_gereed"] else "degraded",
+            "status": (
+                "ok"
+                if database_ok
+                and dependencies["media_stack_gereed"]
+                and request.app.state.storage_error is None
+                else "degraded"
+            ),
             "versie": __version__,
             "database": "ok" if database_ok else "fout",
+            "opslag": (
+                "ok" if request.app.state.storage_error is None else request.app.state.storage_error
+            ),
             "dependencies": dependencies,
         }
 
@@ -930,6 +960,101 @@ def create_api_router() -> APIRouter:
         assert row is not None
         return _as_bool_fields(dict(row))
 
+    @router.get("/opslag")
+    async def get_storage(request: Request) -> dict[str, Any]:
+        database = _database(request)
+        request.app.state.storage_error = storage_validation_error(_settings(request))
+        result = storage_report(_settings(request))
+        active = database.fetch_one(
+            "SELECT COUNT(*) AS aantal FROM job WHERE status IN ('bezig','verifieren')"
+        )
+        result["actieve_jobs"] = int(active["aantal"]) if active is not None else 0
+        result["achtergrondtaken"] = len(request.app.state.background_tasks)
+        result["opslagfout"] = request.app.state.storage_error
+        return result
+
+    def storage_candidate(body: StorageChoice, request: Request) -> Settings:
+        try:
+            return build_storage_candidate(
+                _settings(request),
+                storage_mode=body.modus,
+                workspace_path=body.werkruimte_pad,
+                backup_location=body.backups_op,
+                system_disk_reserve_gb=body.systeemschijf_reserve_gb,
+            )
+        except StorageChangeError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @router.post("/opslag/controle")
+    async def check_storage(body: StorageChoice, request: Request) -> dict[str, Any]:
+        candidate = storage_candidate(body, request)
+        try:
+            missing = prepare_storage(candidate, create=False)
+            result = storage_report(candidate)
+        except (OSError, StorageChangeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        result["te_maken_mappen"] = missing
+        result["controle"] = "veilig toepasbaar"
+        return result
+
+    @router.patch("/opslag")
+    async def update_storage(body: StorageApply, request: Request) -> dict[str, Any]:
+        if body.bevestiging != "OPSLAG WIJZIGEN":
+            raise HTTPException(409, "Typ exact OPSLAG WIJZIGEN")
+        database = _database(request)
+        current = _settings(request)
+        candidate = storage_candidate(body, request)
+        active = database.fetch_one(
+            "SELECT COUNT(*) AS aantal FROM job WHERE status IN ('bezig','verifieren')"
+        )
+        if active is not None and int(active["aantal"]):
+            raise HTTPException(409, "Stop actieve jobs voordat je de opslag wijzigt")
+        if request.app.state.background_tasks:
+            raise HTTPException(409, "Wacht tot scans en kwaliteitsproeven klaar zijn")
+        workspace_changes = (
+            candidate.cache_root != current.cache_root or candidate.work_root != current.work_root
+        )
+        if workspace_changes and not transient_storage_is_empty(current):
+            raise HTTPException(
+                409,
+                "Maak de huidige cache en werkmap gecontroleerd leeg voordat je wisselt",
+            )
+        try:
+            prepare_storage(candidate, create=True)
+            persist_storage(current, candidate)
+        except (OSError, StorageChangeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        old = json.dumps(storage_report(current), ensure_ascii=False)
+        database.execute(
+            "UPDATE worker_config SET gepauzeerd=1,"
+            "pauze_reden='opslag gewijzigd; controleer en hervat'"
+        )
+        if candidate.storage_mode == "systeemschijf":
+            database.execute(
+                """
+                UPDATE instelling
+                SET cache_pauze_gb=MAX(cache_pauze_gb,?),
+                    cache_waarschuwing_gb=MAX(cache_waarschuwing_gb,?)
+                WHERE id=1
+                """,
+                (
+                    candidate.system_disk_reserve_gb,
+                    candidate.system_disk_reserve_gb + 100,
+                ),
+            )
+        current.activate_storage(candidate)
+        request.app.state.storage_error = None
+        result = storage_report(current)
+        database.execute(
+            "INSERT INTO auditlog(soort,onderwerp,oud,nieuw,tijd) "
+            "VALUES ('opslag','werkruimte',?,?,?)",
+            (old, json.dumps(result, ensure_ascii=False), datetime.now(UTC).isoformat()),
+        )
+        result["melding"] = (
+            "Opslag actief; beide workers blijven gepauzeerd tot je ze controleert en hervat"
+        )
+        return result
+
     @router.patch("/instellingen")
     async def update_settings(body: SettingsPatch, request: Request) -> dict[str, Any]:
         values = body.model_dump(exclude_none=True)
@@ -940,6 +1065,15 @@ def create_api_router() -> APIRouter:
         assert current is not None
         pause = int(values.get("cache_pauze_gb", current["cache_pauze_gb"]))
         warning = int(values.get("cache_waarschuwing_gb", current["cache_waarschuwing_gb"]))
+        app_settings = _settings(request)
+        if (
+            app_settings.storage_mode == "systeemschijf"
+            and pause < app_settings.system_disk_reserve_gb
+        ):
+            raise HTTPException(
+                422,
+                "Cachepauze mag niet onder de vaste systeemschijfreserve komen",
+            )
         if pause >= warning:
             raise HTTPException(422, "Cachepauze moet lager zijn dan cachewaarschuwing")
         for key in (

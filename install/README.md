@@ -6,20 +6,28 @@ aparte gebruiker zonder die groepen.
 
 1. Plaats de uiteindelijke projectmap op de host, bijvoorbeeld
    `/opt/av1-pipeline`.
-2. Koppel de aparte 1 TB-SSD permanent aan `/srv/av1-pipeline`. Laat Ubuntu
-   dit met UUID doen; controleer na een herstart dat `mountpoint
-   /srv/av1-pipeline` nog steeds slaagt. Het installatiescript stopt bewust
-   als dit geen echte mount is.
+2. Laat `/srv/av1-pipeline` als gewone map op de 1-TB-systeemschijf staan. Het
+   installatiescript controleert dat dit werkelijk dezelfde rootdisk is en
+   maakt alleen de beheerde submappen.
 3. Draai als root: `sudo bash install/installeer-ubuntu-26.04.sh /opt/av1-pipeline`.
 4. Maak `backend/.venv`, installeer de Python-dependencies en bouw de
    frontend volgens fase 0 en de volgende prompts.
 5. Kopieer `systemd/av1-pipeline.env.example` naar
-   `/etc/av1-pipeline.env` en pas uitsluitend de paden aan.
+   `/etc/av1-pipeline.env`. Kies latere werkopslag via de UI, niet door losse
+   cachepaden handmatig uit elkaar te trekken.
 6. Start pas de backendservice nadat de healthcheck is geïmplementeerd.
 
-Gebruik de SSD voor cache, tijdelijke verwerking, database/logs en recente
-back-ups. Het pakket gebruikt geen prullenbak: een geverifieerd resultaat
+Standaard delen cache, tijdelijke verwerking, database/logs en herstelkopieën
+de systeemschijf. Minimaal 150 GB blijft buiten bereik van nieuwe jobs. Het
+pakket gebruikt geen prullenbak: een geverifieerd resultaat
 vervangt de bron atomisch op de mediavolume.
+
+Krijg je later een extra schijf, mount die dan eerst blijvend met Ubuntu,
+bijvoorbeeld op `/mnt/av1-werkruimte`, en geef `av1pipeline` toegang. Kies
+daarna in **Instellingen → Opslag kiezen** voor een aparte werkschijf, voer de
+droge controle uit en bevestig de wijziging. Cache en werk verhuizen als één
+indeling; nieuwe back-ups kunnen apart op systeem- of werkschijf blijven.
+Workers blijven na de wissel gepauzeerd tot je de diagnose hebt gecontroleerd.
 
 Het installatiescript maakt één lokale sleutel in
 `/etc/av1-pipeline-secrets.key`, leesbaar voor root en de backendservice. Die

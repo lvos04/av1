@@ -1,7 +1,7 @@
-# Fase 11 — SSD, herstel en beheersbare onderdelen
+# Fase 11 — opslag, herstel en beheersbare onderdelen
 
-**Doel:** maak de 1 TB-project-SSD, vervanging, herstel en optionele functies
-echt robuust en eenvoudig beheersbaar.
+**Doel:** maak de gedeelde 1-TB-systeemschijf, een latere werkschijf,
+vervanging, herstel en optionele functies robuust en eenvoudig beheersbaar.
 
 **Duur:** 5-8 uur.
 
@@ -17,21 +17,25 @@ echt robuust en eenvoudig beheersbaar.
 
 ## Opdracht
 
-### 1. De eigen 1 TB-SSD
+### 1. Systeemschijf en latere werkschijf
 
-Gebruik uitsluitend `/srv/av1-pipeline` als `PIPELINE_ROOT`. Controleer bij
-start én vóór iedere job:
+Gebruik `/srv/av1-pipeline/config` altijd voor SQLite, logs en de atomisch
+opgeslagen opslagkeuze. Cache en werk staan standaard op dezelfde
+systeemschijf. Controleer bij start én vóór iedere job:
 
-- dat dit een werkelijk mountpoint is, geen gewone map op de systeemschijf;
-- dat `cache`, `work`, `config` en `backups` bestaan en de juiste eigenaar
-  hebben;
-- dat de SSD schrijfbaar is en genoeg ruimte heeft, inclusief alle bestaande
-  reserveringen;
+- dat de gekozen werkruimte en haar afgeleide submappen bestaan en de juiste
+  eigenaar hebben;
+- dat in systeemschijfmodus minstens 150 GB plus alle bestaande reserveringen
+  vrij blijft;
+- dat aparte-schijfmodus een werkelijk afzonderlijk mountpoint gebruikt;
 - dat iedere library schrijfbaar is en op het verwachte `st_dev` staat.
 
 De planner reserveert atomisch `CACHE_RESERVE_FACTOR × bron_grootte` per job.
-Begin met maximaal twee gelijktijdige jobs op de 1 TB-SSD. Toon vrije ruimte,
-gereserveerde ruimte en de reden van een blokkade op het dashboard.
+Begin met maximaal twee gelijktijdige jobs. Toon modus, vrije ruimte,
+gereserveerde ruimte, harde systeembodem en blokkadereden op het dashboard.
+Voeg **Instellingen → Opslag kiezen** toe: systeemschijf of een vooraf gemounte
+werkschijf, plus de locatie voor nieuwe back-ups. Een wissel pauzeert workers,
+vereist lege tijdelijke mappen, schrijft atomisch en mount/formatteert nooit.
 
 ### 2. Crashveilige vervanging
 
@@ -83,7 +87,11 @@ voor bestanden, GB en jobs per dag, standaard actief voor nieuwe libraries.
 
 ## Acceptatietest
 
-- backend start niet als `/srv/av1-pipeline` geen echte mount is
+- backend en herstel-UI blijven bereikbaar als een latere werkschijf ontbreekt;
+  workers blijven dan aantoonbaar gepauzeerd
+- systeemschijfmodus kan de vaste 150-GB-bodem niet omzeilen
+- aparte-schijfmodus weigert een gewone map, symlink en librarypad
+- opslag wisselt alleen zonder actieve jobs en met lege tijdelijke mappen
 - twee actieve jobs reserveren samen ruimte; een derde job wacht eerlijk
 - een gesimuleerde crash na iedere vervangstap geeft na herstart óf bron óf
   volledig gecontroleerd resultaat terug, nooit een ontbrekend pad
@@ -96,6 +104,6 @@ voor bestanden, GB en jobs per dag, standaard actief voor nieuwe libraries.
 
 ## Niet doen
 
-- Geen automatische formattering, partitionering of mountwijziging van de SSD.
+- Geen automatische formattering, partitionering of mountwijziging van een schijf.
 - Geen cross-volume `rename` als zogenaamde atomische vervanging.
 - Geen opslag van geheimen in plaintext in SQLite.

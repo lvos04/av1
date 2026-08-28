@@ -36,6 +36,7 @@ def _planner_case(tmp_path: Path) -> tuple[Database, Settings, list[int]]:
         backup_root=roots["backups"],
         database_path=roots["config"] / "app.db",
         max_active_jobs=2,
+        storage_mode="aparte_schijf",
     )
     database = Database(configured)
     database.initialize()

@@ -72,16 +72,18 @@ Staan voluit in `spec/04-veiligheidsregels.md`. De kern:
 7. **HDR10+ altijd overslaan.** Geen forceerknop, geen stille uitzondering.
 8. **Hardlinks standaard overslaan.** Een expliciete keuze mag alleen de
    hardlink verbreken; de UI mag nooit herstel beloven.
-9. **De 1 TB-SSD is cache en werkruimte.** De geverifieerde vervanging gebeurt
-   op de bibliotheekschijf zelf.
+9. **De 1 TB-systeemschijf heeft een harde vrije-ruimtebodem.** Cache en werk
+   staan daar standaard, maar de UI kan ze later samen naar een vooraf gemounte
+   extra schijf verplaatsen. De geverifieerde vervanging gebeurt altijd op het
+   bibliotheekfilesystem zelf.
 10. **Bestandsrechten en hersteltransacties zijn verplicht.** Deze onderdelen
    zijn niet via de UI uitschakelbaar.
 
 Lees voor beheerfuncties, kwaliteitscontrole, instellingen en externe
 koppelingen ook `spec/07-bediening-en-beheer.md`. API-sleutels zijn geheimen:
 versleuteld opslaan en nooit naar logs, de browser of een foutmelding sturen.
-Lees voor de SSD-indeling, herstel na een crash en optionele schakelaars ook
-`spec/08-opslag-herstel-en-schakelaars.md`.
+Lees voor de single-diskindeling, latere werkschijf, crashherstel en
+schakelaars ook `spec/08-opslag-herstel-en-schakelaars.md`.
 Voor alle frontend- en Figma-aanpassingen lees je ook
 `spec/09-figma-afstemming.md`. Het Figma-ontwerp is visueel uitgangspunt; de
 veiligheidsregels van dit pakket gaan bij ieder verschil voor.
@@ -125,8 +127,10 @@ falen stil.
 
 ```
 /library                         je media, read-write
-/srv/av1-pipeline/cache          1 TB-SSD: werkmap, 2-3x grootste bestand
-/srv/av1-pipeline/config         1 TB-SSD: SQLite en logs
+/srv/av1-pipeline/cache          standaardcache op systeemschijf
+/srv/av1-pipeline/config         vaste SQLite, opslagkeuze en logs
+# later optioneel, uitsluitend na UI-keuze:
+/mnt/av1-werkruimte/cache        cache op een afzonderlijk gemount filesystem
 ```
 
 De cache staat buiten `/library`: een half afgemaakte encode mag Jellyfin
@@ -139,5 +143,5 @@ acceptatietest; ga niet door voordat die groen is.
 
 <!-- Houd hieronder bij waar je bent gebleven. -->
 
-**Huidige fase:** voltooid — wacht op fysieke SSD/library, rebootcontrole en menselijke duur-/tv-test
-**Klaar:** 0 — scaffold/host; 1 — analyse/DV; 2 — catalogus; 3 — veilige uitvoering, metadata/ACL/xattr, verificatie en atomische vervanging; 4 — wachtrij en workers; 5 — REST-API, WebSocket en systeembewaking; 6 — Next.js-frontend, live dashboard, gevirtualiseerde wachtrij en workers; 7 — beslissingen, bibliotheken, profielen, logs en gegroepeerde fouten; 8 — verificatiebadge, echte profielproef, voor/na, VMAF-detectie en versleutelde Jellyfin/Radarr/Sonarr-koppelingen; 9 — onderhoud, cachegrenzen, logrotatie en 100.000-job schaaltest; 10 — instellingen, hardwarediagnose, integraties, hardlinkbevestiging en toegankelijk beheer; 11 — SSD-controles, crashherstel, schakelaars, back-upmanifesten en canary-planner
+**Huidige fase:** voltooid — single-diskmodus gereed; wacht op library, rebootcontrole en menselijke duur-/tv-test
+**Klaar:** 0 — scaffold/host; 1 — analyse/DV; 2 — catalogus; 3 — veilige uitvoering, metadata/ACL/xattr, verificatie en atomische vervanging; 4 — wachtrij en workers; 5 — REST-API, WebSocket en systeembewaking; 6 — Next.js-frontend, live dashboard, gevirtualiseerde wachtrij en workers; 7 — beslissingen, bibliotheken, profielen, logs en gegroepeerde fouten; 8 — verificatiebadge, echte profielproef, voor/na, VMAF-detectie en versleutelde Jellyfin/Radarr/Sonarr-koppelingen; 9 — onderhoud, cachegrenzen, logrotatie en 100.000-job schaaltest; 10 — instellingen, hardwarediagnose, integraties, hardlinkbevestiging en toegankelijk beheer; 11 — single-diskbescherming, UI-opslagkeuze, crashherstel, schakelaars, back-upmanifesten en canary-planner

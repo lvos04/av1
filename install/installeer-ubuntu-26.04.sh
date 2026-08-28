@@ -23,9 +23,16 @@ if [[ ! -f "$PROJECT_DIR/systemd/av1-pipeline-backend.service" ]]; then
     echo "Geen AV1-projectmap gevonden op: $PROJECT_DIR" >&2
     exit 1
 fi
-if ! mountpoint -q /srv/av1-pipeline; then
-    echo "De project-SSD moet eerst vast aangekoppeld zijn op /srv/av1-pipeline." >&2
-    echo "Installeer niet verder op een gewone map op de systeemschijf." >&2
+if [[ -L /srv/av1-pipeline ]]; then
+    echo "/srv/av1-pipeline mag geen symlink zijn." >&2
+    exit 1
+fi
+install -d -o root -g root -m 0755 /srv/av1-pipeline
+root_device=$(findmnt -n -o SOURCE -T /)
+pipeline_device=$(findmnt -n -o SOURCE -T /srv/av1-pipeline)
+if [[ $root_device != "$pipeline_device" ]]; then
+    echo "De standaardinstallatie verwacht /srv/av1-pipeline op de systeemschijf." >&2
+    echo "Kies een latere aparte werkschijf veilig via de interface." >&2
     exit 1
 fi
 

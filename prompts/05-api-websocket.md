@@ -57,7 +57,7 @@ POST   /api/systeem/qsv-test          onschadelijke VAAPI/QSV-capabiliteitstest
 POST   /api/systeem/gpu-herstart      alleen diagnostiek/herstart meetproces;
                                       nooit blind kernel-drivers resetten
 GET    /api/systeem/diagnose
-GET    /api/systeem/mounts            SSD- en librarystatus
+GET    /api/systeem/mounts            werkopslag- en librarystatus
 POST   /api/backups/nu
 POST   /api/backups/{id}/controleer-herstel
 
