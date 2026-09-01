@@ -6,6 +6,13 @@ vrije-ruimtebodem vrij. Een later toegevoegde schijf kan in de UI als
 werkruimte worden gekozen nadat Ubuntu hem heeft gemount; formatteren en
 mounten blijven uitdrukkelijk beheerhandelingen buiten de pipeline.
 
+Dit verbod geldt voor werk- en cacheschijven: de UI formatteert, partitioneert
+of mount die nooit. Bibliotheekbronnen zijn anders. Een expliciet ingevoerd
+`smb://server/share/map` mag via de geïnstalleerde, streng begrensde helper een
+CIFS-automount onder `/library/netwerk` krijgen. De helper is root-owned,
+accepteert alleen privé-netwerkservers en heeft `nosuid,nodev,noexec`; FastAPI
+zelf blijft zonder rootrechten.
+
 ## Vaste control-plane en gekozen werkruimte
 
 `/srv/av1-pipeline/config` blijft altijd op de systeemschijf. Daardoor blijven
@@ -23,9 +30,11 @@ De planner reserveert vóór een job `CACHE_RESERVE_FACTOR` maal de brongrootte
 en telt reserveringen van lopende CPU- en GPU-jobs bij elkaar op. In
 systeemschijfmodus moet daar standaard nog minimaal 150 GB werkelijk vrij
 boven blijven; de UI kan die bodem verhogen, maar niet onder 150 GB brengen.
-Waarschuwen begint bij 250 GB. Met 1 TB
-is één CPU- en één GPU-job meestal realistisch; `MAX_ACTIVE_JOBS=2` blijft de
-veilige start.
+Waarschuwen begint bij 250 GB. Met 1 TB is één CPU- en één GPU-job meestal
+realistisch. De actuele totale encodeconcurrency staat in SQLite, begint op 1
+voor de huidige 15-GiB-host en kan na een RAM-upgrade zonder vaste
+applicatiebovengrens worden verhoogd. Cache- en mountcontroles blijven iedere
+extra claim afzonderlijk begrenzen.
 
 De pagina **Instellingen → Opslag kiezen** biedt twee modi:
 
@@ -74,13 +83,14 @@ werk van dat onderdeel, ruimt geen data op en verandert geen geslaagde jobs.
 | Jellyfin-pauze | uit | negeert afspeelsessies; CPU-planner werkt normaal |
 | Radarr | uit | stuurt geen film-refreshes |
 | Sonarr | uit | stuurt geen serie-refreshes |
-| LAN/externe toegang | uit | alleen lokale toegang; activeren vereist wachtwoord/proxy |
+| LAN/externe toegang | uit | de LAN-gateway weigert andere apparaten; activeren vereist een apart wachtwoord |
 | Hardlink verbreken | uit | hardlinks worden weer standaard overgeslagen |
 | Experimenteel Dolby Vision | uit | DV blijft volgens profiel overslaan |
 | Automatische back-ups | aan | maakt geen nieuwe schema-back-ups; bestaande blijven staan |
 | Canary-limiet | aan | maakt gecontroleerde batches mogelijk; `uit` vereist extra bevestiging |
+| AI-controller | uit, schaduw gereed | stopt nieuwe AI-analyses; besluiten en historie blijven staan |
 
-De volgende zaken zijn geen schakelaars: goedkeuring vóór uitvoering,
+De volgende zaken zijn geen schakelaars: de goedkeurings-/policy-poort vóór uitvoering,
 metadata-verificatie, behoud van bestandsrechten, mountcontrole en
 hersteltransacties. Ze beschermen gegevens en blijven actief.
 
@@ -93,9 +103,13 @@ databasefout, geen bescherming tegen fysiek schijfdefect. De geheime sleutel sta
 De UI biedt een **herstelcontrole** die een back-up naar een tijdelijke SQLite-
 database kopieert en opent, zonder de werkende database te wijzigen.
 
-De webapp bindt standaard alleen lokaal. Toegang vanaf je thuisnetwerk is een
-optionele functie met een reverse proxy, TLS waar mogelijk en een apart
-wachtwoord. De backend zelf blijft op `127.0.0.1` gebonden.
+De FastAPI-backend bindt altijd uitsluitend op `127.0.0.1`. De ingebouwde
+frontend-gateway luistert op poort 3000, maar weigert niet-lokale verzoeken
+zolang LAN-toegang uitstaat. Na expliciete bevestiging laat hij alleen
+privé-adressen door met HTTP Basic-authenticatie, een geheugenhard gehasht
+wachtwoord, tijdelijke blokkade na herhaalde fouten en dezelfde afscherming
+voor de WebSocket. Stuur deze poort niet door in de router; gebruik voor
+toegang buiten het thuisnetwerk een VPN en TLS.
 
 ## Canary-modus
 
@@ -106,3 +120,10 @@ goedkeuring mag de library naar normale planning. De testbibliotheek bevat
 korte representatieve fragmenten van HDR10, HDR10+, Dolby Vision, hardlinks,
 ASS-lettertypen, mov_text en meerdere audioformaten; regressietests draaien
 bij elke wijziging aan media-code of FFmpeg.
+
+Na canary-vrijgave scant de backend actieve libraries intern en incrementeel.
+Nieuwe of gewijzigde media wacht minstens zestig minuten en moet vóór en na
+`ffprobe` exact hetzelfde device, inode, formaat en mtime hebben. Verdwenen
+media blijft als historie bestaan. Een profiel- en besliscodefingerprint zorgt
+dat alleen relevante wijzigingen opnieuw worden beoordeeld; een geslaagde
+atomische vervanging schrijft de nieuwe baseline direct terug.

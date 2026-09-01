@@ -6,7 +6,7 @@ veiligheidsregels in `04-veiligheidsregels.md` voor.
 
 ## Navigatie en algemeen gedrag
 
-De vaste navigatie is: Dashboard, Beslissingen, Wachtrij, Workers,
+De vaste navigatie is: Dashboard, Beslissingen, AI, Wachtrij, Workers,
 Bibliotheken, Profielen, Kwaliteit, Logs, Fouten en Instellingen.
 Donkere modus is de standaard. Ondersteun `j`/`k` voor rijen, `/` voor zoeken
 en `?` voor een zichtbaar overzicht van sneltoetsen. Iedere knop is met
@@ -29,6 +29,10 @@ De Workers-pagina is geen grafische versiering: per CPU- en GPU-baan zijn
 worker-aantal, encoder, `nice`, stiltevenster, huidige job, laatste twintig
 jobs, doorvoer, besparing en pauzereden zichtbaar en instelbaar. Een hitte-,
 cache- of Jellyfin-pauze mag niet worden voorgesteld als een storing.
+De totale encodeconcurrency is een afzonderlijk positief geheel getal in
+SQLite. Eén is de aanbevolen beginwaarde op de huidige 15-GiB-host, maar er is
+geen vaste bovengrens die een latere RAM-upgrade blokkeert. De per-baanwaarden
+bepalen hoeveel CPU- en GPU-workers daarvan gebruik mogen maken.
 
 ## Beslissingen, hardlinks en wachtrij
 
@@ -50,10 +54,56 @@ mediabestand wordt verwijderd.
 
 ## Bibliotheken en profielen
 
-Een library-kaart toont pad, profiel, aantallen, omvang, scanmoment en
-voortgang. "Genereer optimalisatievoorstellen" analyseert alleen en plant
-niets automatisch in. Scan, droogloop en profielwisseling zijn afzonderlijke
-acties.
+Een library-kaart toont pad, profiel, aantallen, omvang, de geverifieerde totale
+besparing met het percentage van de verwerkte brondata, laatste en volgende
+scan, stabiliteitswachtrij en voortgang. Scanpresets zijn Handmatig, Dagelijks
+en Wekelijks; een interne scheduler rekent 03:00 in de ingestelde IANA-tijdzone
+uit en haalt een tijdens uitschakeling gemist moment niet in. Scan, droogloop,
+scanschema en profielwisseling zijn afzonderlijke acties.
+
+Media- en duurprobes draaien nooit binnen een SQLite-schrijftransactie. Een
+tijdelijke database-lock mag de planner, scanscheduler of AI-controller niet
+definitief stoppen; iedere permanente achtergrondloop logt de fout en probeert
+bij zijn volgende interval opnieuw.
+
+Als een veiligheidswijziging de bestaande AI-toestemming intrekt, wordt een
+eventuele half afgemaakte scan met behoud van historie afgesloten en de cursor
+gewist. De daaropvolgende scan begint bewust bij het begin, zodat geen bestand
+vóór de oude cursor met een verouderde toestemming achterblijft.
+
+Een bibliotheek kan na een exacte tekstbevestiging uit de pipeline worden
+verwijderd. Dit ruimt haar catalogus, besluiten, jobs, scans, AI-historie en
+exact bekende lokale pipeline-output op. De bronmap, mediabestanden en een
+eventuele SMB-mount worden nooit verwijderd of ontkoppeld. Een actieve scan,
+proefdraai, job of onafgeronde vervanging blokkeert de actie.
+
+Instellingen bevat een eigen AI-controllerkaart met provider, model,
+schaduw/actief, bevoegdheden, maandbudget, verbruik, versleutelde sleutel en
+de afzonderlijke HDR10-metadata-poort. Het model krijgt alleen gegroepeerde,
+allowlisted technische velden en HMAC-paden. Actieve modus en HDR10-vrijgave
+hebben ieder een exacte bevestiging. Een profiel-, media-, FFmpeg-hoofdversie-
+of policywijziging trekt niet-gestarte AI-toestemming in en activeert canary.
+
+AI heeft een eigen overzichtspagina met de getypeerde voorstellen, de lokale
+policy-uitkomst, eventuele uitvoering, redencodes en bewijsvelden. Twee grafieken
+tonen per lokale kalenderdag het token-/kostenverbruik en de aantallen besluiten
+per classificatie. De pagina toont nooit de API-sleutel of ruwe bronpaden die
+naar de provider zijn gestuurd.
+
+De OpenAI-provider gebruikt `gpt-5.6-luna` via de Responses API met
+`reasoning.effort=medium`, Structured Outputs, `store:false`, maximaal 8.000
+inputtokens en 800 outputtokens per groep. De applicatie rekent met de
+[officiële modelprijzen](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+van $0,20 per miljoen inputtokens en $1,20 per miljoen outputtokens en stopt
+standaard bij $10 per kalendermaand. Volgens de
+[OpenAI Data Controls](https://developers.openai.com/api/docs/guides/your-data)
+wordt API-data niet voor training gebruikt; standaard abuse-monitoring kan
+maximaal dertig dagen worden bewaard.
+
+De providerinterface houdt ruimte voor een latere lokale
+[`gpt-oss-20b`](https://developers.openai.com/api/docs/models/gpt-oss-20b)-provider
+op TrueNAS. Die koppeling begint uitsluitend in schaduwmodus; de huidige CPU-
+host zonder dedicated GPU is niet de vrijgegeven actieve route.
 
 Een profiel beschrijft alle beslisinstellingen, met korte uitleg: drempels,
 CRF, preset, CPU/GPU-keuze, HDR-beleid, Dolby Vision-modus, talen,
@@ -81,6 +131,12 @@ logregels, diagnose, gevolgen en veilige actie. Voorbeelden:
   expliciete keuze, geen automatische degradatie.
 - Cache te laag: pas grens of ruimte aan; tijdelijk cachemateriaal mag alleen
   worden opgeruimd wanneer het niet bij een actieve job hoort.
+
+Iedere mislukte uitvoerjob mag na een overeenkomend getypeerd AI-voorstel en
+lokale idempotentiecontrole exact één automatische herstelpoging krijgen. De
+eerste poging blijft volledig in `job_poging` bewaard. Mislukt poging twee,
+dan blijft de fout staan voor menselijke diagnose; encoder- en baanwissels
+gebeuren nooit als onderdeel van die retry.
 
 Een "driver reset" reset nooit een kernel-driver vanuit de webapp. Hij start
 hoogstens het optionele GPU-meetproces opnieuw en verwijst voor herstel van de

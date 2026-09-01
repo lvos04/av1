@@ -18,6 +18,20 @@ class VerificationResult:
     mastering_equal: bool
 
 
+def _content_light_equal(source: object, result: object) -> bool:
+    """Behandel uitsluitend ontbrekend en 0,0 als dezelfde lege CLL-waarde."""
+
+    source_value = str(source or "")
+    result_value = str(result or "")
+    if source_value == result_value:
+        return True
+    # MaxCLL=0 en MaxFALL=0 bevatten geen gemeten lichtinformatie. libsvtav1
+    # accepteert die waarden, maar laat de lege record in AV1 weg. Niet-nul
+    # waarden blijven hieronder bewust exact vergeleken.
+    empty_values = {"", "0,0"}
+    return source_value in empty_values and result_value in empty_values
+
+
 def verify_result(
     source_probe: dict[str, Any],
     result_path: Path,
@@ -31,7 +45,9 @@ def verify_result(
         return VerificationResult(False, "HDR10+ had nooit uitgevoerd mogen worden", result, False)
     mastering_equal = source_probe.get("mastering_display") == result.get(
         "mastering_display"
-    ) and source_probe.get("content_light") == result.get("content_light")
+    ) and _content_light_equal(
+        source_probe.get("content_light"), result.get("content_light")
+    )
     if bool(source_probe.get("is_hdr10")) and (
         not bool(result.get("is_hdr10")) or not mastering_equal
     ):

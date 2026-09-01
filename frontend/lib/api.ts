@@ -18,10 +18,11 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     const value: unknown = await response.json().catch(() => null);
-    const detail =
+    const rawDetail =
       typeof value === "object" && value !== null && "detail" in value
-        ? JSON.stringify(value.detail)
+        ? value.detail
         : response.statusText;
+    const detail = typeof rawDetail === "string" ? rawDetail : JSON.stringify(rawDetail);
     throw new ApiError(response.status, detail);
   }
   return (await response.json()) as T;

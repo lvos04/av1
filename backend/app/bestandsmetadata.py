@@ -87,21 +87,28 @@ def capture_metadata(path: Path) -> FileMetadata:
 
 def apply_metadata(path: Path, metadata: FileMetadata) -> None:
     try:
-        os.chown(path, metadata.uid, metadata.gid, follow_symlinks=False)
-        os.chmod(path, metadata.mode, follow_symlinks=False)
+        current_stat = path.stat()
+        if (current_stat.st_uid, current_stat.st_gid) != (metadata.uid, metadata.gid):
+            os.chown(path, metadata.uid, metadata.gid, follow_symlinks=False)
+        if stat.S_IMODE(current_stat.st_mode) != metadata.mode:
+            os.chmod(path, metadata.mode, follow_symlinks=False)
     except OSError as exc:
         raise MetadataError(f"Eigenaar of mode herstellen mislukt: {exc}") from exc
 
-    acl_result = subprocess.run(
-        ["setfacl", "--set-file=-", str(path)],
-        input=metadata.acl + "\n",
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if acl_result.returncode != 0:
-        raise MetadataError(f"POSIX-ACL herstellen mislukt: {acl_result.stderr.strip()}")
+    # CIFS kan een vaste, synthetische ACL presenteren maar geen setfacl
+    # ondersteunen. Als die zichtbare ACL al exact klopt, hoeft er niets te
+    # worden gezet; iedere echte afwijking blijft hard falen.
+    if _acl(path) != metadata.acl:
+        acl_result = subprocess.run(
+            ["setfacl", "--set-file=-", str(path)],
+            input=metadata.acl + "\n",
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if acl_result.returncode != 0:
+            raise MetadataError(f"POSIX-ACL herstellen mislukt: {acl_result.stderr.strip()}")
     try:
         current_names = {
             name

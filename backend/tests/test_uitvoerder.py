@@ -88,6 +88,22 @@ async def test_hdr_wordt_pas_na_verificatie_atomisch_vervangen(tmp_path: Path) -
     ).stdout
     assert "user:daemon:r--" in acl
     assert database.fetch_one("SELECT status FROM job WHERE id=?", (job_id,))[0] == "klaar"
+    catalog = database.fetch_one(
+        "SELECT grootte,mtime,inode,probe FROM bestand WHERE id="
+        "(SELECT bestand_id FROM job WHERE id=?)",
+        (job_id,),
+    )
+    assert catalog is not None
+    assert catalog["grootte"] == source.stat().st_size
+    assert catalog["mtime"] == source.stat().st_mtime
+    assert catalog["inode"] == source.stat().st_ino
+    assert json.loads(str(catalog["probe"]))["codec"] == "av1"
+    decision_count = database.fetch_one("SELECT COUNT(*) FROM besluit")[0]
+    scan_library(database, 1)
+    assert database.fetch_one("SELECT COUNT(*) FROM besluit")[0] == decision_count
+    assert database.fetch_one(
+        "SELECT status FROM job_poging WHERE job_id=?", (job_id,)
+    )[0] == "klaar"
     assert (
         database.fetch_one("SELECT status FROM vervang_transactie WHERE job_id=?", (job_id,))[0]
         == "vervangen"
@@ -168,3 +184,42 @@ async def test_explicitiet_bevestigde_hardlink_wordt_alleen_op_bronpad_verbroken
     assert file_sha256(source) != old_hash
     assert source.stat().st_ino != torrent.stat().st_ino
     assert source.stat().st_nlink == 1 and torrent.stat().st_nlink == 1
+
+
+@pytest.mark.asyncio
+async def test_grotere_opschoonremux_is_veilig_geen_besparing(tmp_path: Path) -> None:
+    database, configured, source, job_id = _case(tmp_path, "sdr-meertalig.mkv")
+    before_hash = file_sha256(source)
+    decision_row = database.fetch_one("SELECT besluit_id FROM job WHERE id=?", (job_id,))
+    assert decision_row is not None
+    decision_id = int(decision_row["besluit_id"])
+    decision = database.fetch_one("SELECT payload FROM besluit WHERE id=?", (decision_id,))
+    assert decision is not None
+    payload = json.loads(str(decision["payload"]))
+    payload["actie"] = "opschonen"
+    database.execute(
+        "UPDATE besluit SET actie='opschonen',payload=? WHERE id=?",
+        (json.dumps(payload), decision_id),
+    )
+    partial = configured.cache_root / str(job_id) / f"{source.name}.deel"
+    script = (
+        "import pathlib,shutil,sys;shutil.copyfile(sys.argv[1],sys.argv[2]);"
+        "pathlib.Path(sys.argv[2]).open('ab').write(b'x')"
+    )
+
+    assert not await run_job(
+        database,
+        configured,
+        job_id,
+        storage_validator=lambda: None,
+        command_override=["/usr/bin/python3", "-c", script, str(source), str(partial)],
+    )
+
+    assert file_sha256(source) == before_hash
+    job = database.fetch_one("SELECT status,foutsoort FROM job WHERE id=?", (job_id,))
+    assert job is not None and job["status"] == "overgeslagen"
+    assert job["foutsoort"] == "GeenBesparing"
+    assert not (configured.cache_root / str(job_id)).exists()
+    assert database.fetch_one(
+        "SELECT status FROM job_poging WHERE job_id=?", (job_id,)
+    )[0] == "overgeslagen"

@@ -60,6 +60,29 @@ def record_failure(database: Database, job_id: int, message: str, error_type: st
         ),
     )
     append_job_log(database, job_id, "error", message)
+    attempt = database.fetch_one("SELECT pogingen,gestart_op FROM job WHERE id=?", (job_id,))
+    if attempt is not None:
+        attempt_number = max(1, int(attempt["pogingen"] or 0))
+        database.execute(
+            """
+            INSERT INTO job_poging(
+                job_id,poging,status,fout,foutsoort,fout_handtekening,gestart_op,klaar_op
+            ) VALUES (?,?,'mislukt',?,?,?,?,?)
+            ON CONFLICT(job_id,poging) DO UPDATE SET
+                status='mislukt',fout=excluded.fout,foutsoort=excluded.foutsoort,
+                fout_handtekening=excluded.fout_handtekening,
+                klaar_op=excluded.klaar_op
+            """,
+            (
+                job_id,
+                attempt_number,
+                message,
+                error_type,
+                signature,
+                attempt["gestart_op"],
+                datetime.now(UTC).isoformat(),
+            ),
+        )
     return same
 
 

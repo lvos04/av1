@@ -4,14 +4,17 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Next.js (React)          poort 3000                         │
-│  dashboard · queue · workers · library · profielen · logs    │
+│  Next.js + LAN-gateway    poort 3000                         │
+│  Basic Auth op LAN · dashboard · workers · library · logs    │
 └───────────────┬──────────────────────────┬───────────────────┘
                 │ REST (mutaties)          │ WebSocket (live)
 ┌───────────────▼──────────────────────────▼───────────────────┐
-│  FastAPI                  poort 8000                         │
+│  FastAPI                  127.0.0.1:8000                    │
 │                                                              │
-│   scanner ──> beslisser ──> wachtrij ──> planner             │
+│ scheduler ─> scanner ─> beslisser ─> AI-policy ─> wachtrij   │
+│                 handmatige/API-scan ────────┘      │         │
+│                                                    ▼         │
+│                                                 planner      │
 │                                             │                │
 │                              ┌──────────────┴─────────┐      │
 │                              ▼                        ▼      │
@@ -30,7 +33,15 @@
 ```
 
 Twee native systemd-services op één Ubuntu-host. De backend is de enige die
-bij je media komt; de frontend praat alleen met de backend.
+bij je media komt en is nooit rechtstreeks vanaf het LAN bereikbaar. De
+frontend-gateway geeft HTTP en WebSocket pas vrij voor privé-adressen nadat
+LAN-toegang met een apart wachtwoord is ingeschakeld.
+
+Lokale bibliotheken mogen op ieder veilig toegankelijk mediapad staan.
+SMB-URI's gaan via één root-owned, wachtwoordloos aanroepbare maar inhoudelijk
+strikt begrensde mounthelper naar `/library/netwerk`; de backend kan daarmee
+geen willekeurig rootcommando uitvoeren. Voor opslag van de library volgt
+altijd een eerste-gebruiktest en voor iedere scan/job een nieuwe mountcheck.
 
 ---
 
@@ -50,14 +61,24 @@ de frontend midden in een encode, dan mis je niets.
 ## Onderdelen
 
 ### scanner
-Loopt door een library, past de naamfilter toe (`startcode/bestandsfilter.py`),
-probet elk bestand (`startcode/probe.py`) en schrijft het resultaat weg. Raakt
-niets aan. Draait op een interval of op verzoek.
+Loopt door een library, vergelijkt eerst pad, grootte, mtime, hardlinks, device
+en inode, en probet alleen nieuwe of gewijzigde media. Een bestand moet zestig
+minuten oud en tijdens de probe byte-/inode-stabiel zijn. Verdwenen media wordt
+als tombstone bewaard. De interne `asyncio`-scheduler rekent lokale 03:00-
+momenten uit; scans overlappen nooit en gemiste momenten worden niet ingehaald.
 
 ### beslisser
 Neemt een probe-resultaat plus een profiel en levert een `Besluit`
 (`startcode/beslissen.py`). **Doet niets.** Het besluit wordt opgeslagen en
-wacht op goedkeuring — zie `04-veiligheidsregels.md`, regel 1.
+wacht op handmatige goedkeuring of de begrensde AI-policy — zie
+`04-veiligheidsregels.md`, regel 1.
+
+### AI-controller
+Analyseert één gegroepeerde handtekening met een getypeerd voorstel. De
+provider krijgt geen tools, ruwe paden, SQLite of ongefilterde logs. Alleen de
+lokale Python-policy kan daarna een waarschuwingvrij besluit bevestigen. Een
+providerfout, budgetstop of verschil voert niets uit. De providerinterface is
+losgekoppeld zodat een lokaal model later eerst in schaduwmodus kan meelopen.
 
 ### wachtrij + planner
 Goedgekeurde besluiten worden jobs. De planner kent elke job toe aan een baan
@@ -68,8 +89,9 @@ Dit is de kern van waarom je dit bouwt: **twee banen die echt tegelijk
 draaien.** Je Arc doet duizenden SDR-afleveringen terwijl je CPU aan een
 handvol 4K HDR-films werkt. Verschillende hardware, geen wachtrij op elkaar.
 
-Standaard één worker per baan. Twee gelijktijdige 4K-encodes vullen je
-tijdelijke map en maken je logs onleesbaar.
+Standaard één worker per baan. Op een host met minder dan 24 GiB begrenst de
+planner de effectieve media-concurrency tot één job totaal; OOM-kills krijgen
+nooit een AI-retry.
 
 ### worker
 Draait één job:

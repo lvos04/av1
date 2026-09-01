@@ -17,7 +17,7 @@ zijn echter leidend. Bij een verschil gaan `04-veiligheidsregels.md`,
 - Een hardlink is standaard **overslaan**. De optionele actie heet “hardlink
   verbreken na bevestiging”; herstel van de oorspronkelijke hardlink wordt
   nooit beloofd.
-- Navigatie: Dashboard, Beslissingen, Wachtrij, Workers, Bibliotheken,
+- Navigatie: Dashboard, Beslissingen, AI, Wachtrij, Workers, Bibliotheken,
   Profielen, Kwaliteit, Logs, Fouten en Instellingen.
 - Instellingen bevat een onderdeel **Onderdelen** met de schakelbare opties uit
   `08-opslag-herstel-en-schakelaars.md`.
@@ -26,6 +26,9 @@ zijn echter leidend. Bij een verschil gaan `04-veiligheidsregels.md`,
   actieve cachejobs.
 - Voeg statusweergave toe voor canary-limiet, hersteltransacties, back-ups,
   behoud van bestandsmetadata en QSV-diagnostiek.
+- Instellingen bevat een afzonderlijke kaart voor LAN-toegang met status,
+  gebruikersnaam, nieuw wachtwoord, exacte bevestiging en de bruikbare URL's;
+  een algemene aan/uit-schakelaar mag geen wachtwoordbeveiliging omzeilen.
 
 ## Ontwerpvolgorde
 

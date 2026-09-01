@@ -52,14 +52,21 @@ def store_decision(
     """Vervang alleen nog niet uitgevoerde besluiten wanneer een bestand veranderde."""
 
     existing = connection.execute(
-        "SELECT id FROM besluit WHERE bestand_id=? AND status='nieuw' ORDER BY id DESC LIMIT 1",
+        "SELECT id,status FROM besluit WHERE bestand_id=? ORDER BY id DESC LIMIT 1",
         (bestand_id,),
     ).fetchone()
+    # Een scan van een onveranderd bestand mag ook na goedkeuring of planning
+    # geen tweede uitvoerbaar besluit maken. Dat veroorzaakte dubbele encodes
+    # zodra een gebruiker opnieuw scande terwijl de eerste job nog liep.
     if existing is not None and not changed:
         return int(existing["id"])
     if changed:
         connection.execute(
-            "DELETE FROM besluit WHERE bestand_id=? AND status IN ('nieuw', 'afgewezen')",
+            """
+            UPDATE besluit
+            SET status='afgewezen',reden=reden || '; vervangen door nieuw scannerbesluit'
+            WHERE bestand_id=? AND status='nieuw'
+            """,
             (bestand_id,),
         )
     cursor = connection.execute(

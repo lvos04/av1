@@ -29,6 +29,10 @@ systeemschijf. Controleer bij start én vóór iedere job:
   vrij blijft;
 - dat aparte-schijfmodus een werkelijk afzonderlijk mountpoint gebruikt;
 - dat iedere library schrijfbaar is en op het verwachte `st_dev` staat.
+- dat iedere nieuwe lokale of SMB-library vóór opslag een tijdelijke
+  schrijf-, fsync-, metadata- en atomaire hernoemtest doorstaat;
+- dat SMB alleen via de vaste root-owned sockethelper naar `/library/netwerk` mount
+  en voor iedere scan/job opnieuw exact dezelfde `server/share` toont.
 
 De planner reserveert atomisch `CACHE_RESERVE_FACTOR × bron_grootte` per job.
 Begin met maximaal twee gelijktijdige jobs. Toon modus, vrije ruimte,
@@ -77,9 +81,11 @@ Maak optionele automatische back-ups met hashmanifest en retentie. Voeg een
 herstelcontrole toe die een kopie naar een tijdelijke database herstelt en
 opent. Toon alleen een geslaagde controle als database en manifest echt kloppen.
 
-Standaard is de app alleen lokaal bereikbaar. Maak LAN-toegang optioneel via
-een reverse proxy met wachtwoord; de FastAPI-backend blijft op `127.0.0.1`.
-Bewaar geen wachtwoorden of API-sleutels in logs, URL's of frontend-state.
+Standaard weigert de frontend-gateway ieder niet-lokaal verzoek. Maak
+LAN-toegang optioneel via dezelfde gateway met een apart, geheugenhard gehasht
+wachtwoord; de FastAPI-backend blijft op `127.0.0.1`. Pas dezelfde controle toe
+op HTTP en WebSocket en blokkeer herhaalde foute aanmeldingen tijdelijk. Bewaar
+geen wachtwoorden of API-sleutels in logs, URL's of frontend-state.
 
 Breid de testbibliotheek uit met korte representatieve bestanden en voer die
 bij iedere verandering aan media-code uit. Maak een canary-planner met maxima
@@ -100,10 +106,13 @@ voor bestanden, GB en jobs per dag, standaard actief voor nieuwe libraries.
 - uitzetten van een optie start geen nieuw werk, maar verwijdert geen data
 - poging om kernveiligheid via API uit te schakelen wordt geweigerd
 - herstelcontrole valideert een back-up zonder de werkende database te raken
-- LAN-toegang is standaard uit
+- LAN-toegang is standaard uit, poort 8000 is niet vanaf het LAN bereikbaar en
+  HTTP plus WebSocket werken na inschakelen via de beveiligde poort 3000
 
 ## Niet doen
 
-- Geen automatische formattering, partitionering of mountwijziging van een schijf.
+- Geen automatische formattering, partitionering of mountwijziging van een
+  cache-/werkschijf. Alleen expliciete SMB-bibliotheek-URI's mogen via de
+  begrensde helper een CIFS-automount krijgen.
 - Geen cross-volume `rename` als zogenaamde atomische vervanging.
 - Geen opslag van geheimen in plaintext in SQLite.

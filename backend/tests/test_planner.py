@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import sqlite3
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from app.media.beslissen import STANDAARD
 from app.planner import Planner, recover_orphaned_jobs
 from app.scanner import scan_library
 from app.uitvoerder import create_job_from_decision
+from app.wachtrijherstel import QueueRecoveryError, queue_recovery_report, recover_queue
 
 
 def _planner_case(tmp_path: Path) -> tuple[Database, Settings, list[int]]:
@@ -40,7 +42,9 @@ def _planner_case(tmp_path: Path) -> tuple[Database, Settings, list[int]]:
     )
     database = Database(configured)
     database.initialize()
-    database.execute("UPDATE instelling SET cache_pauze_gb=0 WHERE id=1")
+    database.execute(
+        "UPDATE instelling SET cache_pauze_gb=0,max_gelijktijdige_encodes=2 WHERE id=1"
+    )
     profile = {
         **STANDAARD,
         "drempel_1080": 300,
@@ -118,6 +122,40 @@ async def test_pauze_van_cpu_laat_gpu_doordraaien(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_totale_grens_een_wisselt_eerlijk_tussen_cpu_en_gpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, configured, _job_ids = _planner_case(tmp_path)
+    database.execute("UPDATE instelling SET max_gelijktijdige_encodes=1 WHERE id=1")
+    planner = Planner(
+        database,
+        configured,
+        storage_validator=lambda: None,
+        machine_guard=lambda _lane: (True, None),
+    )
+
+    async def finish_immediately(job_id: int, _worker_id: str) -> bool:
+        database.execute("UPDATE job SET status='klaar' WHERE id=?", (job_id,))
+        return True
+
+    monkeypatch.setattr(planner, "_worker", finish_immediately)
+
+    await planner.tick()
+    first = database.fetch_one("SELECT id,baan FROM job WHERE status='bezig'")
+    assert first is not None and first["baan"] == "cpu"
+    await asyncio.gather(*planner.tasks.values())
+
+    # Simuleer een blijvende CPU-achterstand. Zonder roterende baanvolgorde
+    # zou deze oudere CPU-job opnieuw winnen en kwam de GPU nooit aan bod.
+    database.execute("UPDATE job SET status='wacht' WHERE id=?", (int(first["id"]),))
+    await planner.tick()
+
+    second = database.fetch_one("SELECT baan FROM job WHERE status='bezig'")
+    assert second is not None and second["baan"] == "gpu"
+    await asyncio.gather(*planner.tasks.values())
+
+
+@pytest.mark.asyncio
 async def test_twee_planners_claimen_dezelfde_job_nooit_dubbel(tmp_path: Path) -> None:
     database, configured, _job_ids = _planner_case(tmp_path)
     database.execute("DELETE FROM job WHERE baan='gpu'")
@@ -162,6 +200,104 @@ def test_backendherstart_herstelt_weesjob_en_deelbestand(tmp_path: Path) -> None
     assert row is not None and row["status"] == "wacht"
     assert row["proces_pid"] is None and row["cache_reservering"] == 0
     assert not cache_dir.exists()
+
+
+def test_backendherstart_ruimt_retrycache_van_wachtende_job_op(tmp_path: Path) -> None:
+    database, configured, job_ids = _planner_case(tmp_path)
+    job_id = job_ids[0]
+    cache_dir = configured.cache_root / str(job_id)
+    work_dir = configured.work_root / str(job_id)
+    cache_dir.mkdir()
+    work_dir.mkdir()
+    (cache_dir / "film.mkv.deel").write_bytes(b"oude retrycache")
+
+    assert recover_orphaned_jobs(database, configured) == 0
+
+    assert not cache_dir.exists() and not work_dir.exists()
+    row = database.fetch_one(
+        "SELECT status,proces_pid,cache_reservering FROM job WHERE id=?", (job_id,)
+    )
+    assert row is not None and row["status"] == "wacht"
+    assert row["proces_pid"] is None and row["cache_reservering"] == 0
+
+
+def test_ui_wachtrijherstel_raakt_alleen_bekende_tijdelijke_jobmappen(
+    tmp_path: Path,
+) -> None:
+    database, configured, job_ids = _planner_case(tmp_path)
+    job_id = job_ids[0]
+    source = configured.library_root / "hdr10.mkv"
+    source_before = source.read_bytes()
+    database.execute(
+        "UPDATE job SET status='bezig',proces_pid=999999,cache_reservering=123 WHERE id=?",
+        (job_id,),
+    )
+    cache_dir = configured.cache_root / str(job_id)
+    work_dir = configured.work_root / str(job_id)
+    cache_dir.mkdir()
+    work_dir.mkdir()
+    (cache_dir / "film.mkv.deel").write_bytes(b"onvolledig")
+    unknown = configured.cache_root / "handmatig-bewaard"
+    unknown.mkdir()
+    (unknown / "notitie.txt").write_text("niet verwijderen", encoding="utf-8")
+
+    report = queue_recovery_report(database, configured)
+    assert report["weesjobs"] == [job_id]
+    assert report["tijdelijke_jobs"] == [job_id]
+    assert str(unknown) in report["onbekende_paden"]
+    assert report["kan_herstellen"] is True
+
+    result = recover_queue(database, configured)
+
+    assert result["herstelde_jobs"] == [job_id]
+    assert not cache_dir.exists() and not work_dir.exists()
+    assert unknown.is_dir() and (unknown / "notitie.txt").is_file()
+    assert source.read_bytes() == source_before
+    row = database.fetch_one(
+        "SELECT status,proces_pid,cache_reservering FROM job WHERE id=?", (job_id,)
+    )
+    assert row is not None and row["status"] == "wacht"
+    assert row["proces_pid"] is None and row["cache_reservering"] == 0
+
+
+def test_ui_wachtrijherstel_weigert_actieve_plannertaak(tmp_path: Path) -> None:
+    database, configured, job_ids = _planner_case(tmp_path)
+    job_id = job_ids[0]
+    database.execute("UPDATE job SET status='bezig' WHERE id=?", (job_id,))
+    cache_dir = configured.cache_root / str(job_id)
+    cache_dir.mkdir()
+
+    report = queue_recovery_report(database, configured, {job_id})
+    assert report["actieve_jobs"] == [job_id]
+    assert report["kan_herstellen"] is False
+    with pytest.raises(QueueRecoveryError, match="echte job actief"):
+        recover_queue(database, configured, {job_id})
+    assert cache_dir.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_onverwachte_startfout_blijft_niet_als_bezig_staan(tmp_path: Path) -> None:
+    database, configured, job_ids = _planner_case(tmp_path)
+    job_id = job_ids[0]
+    database.execute(
+        "UPDATE job SET status='bezig',cache_reservering=123 WHERE id=?", (job_id,)
+    )
+    (configured.cache_root / str(job_id)).mkdir()
+    planner = Planner(
+        database,
+        configured,
+        storage_validator=lambda: None,
+        machine_guard=lambda _lane: (True, None),
+    )
+
+    assert not await planner._worker(job_id, "cpu-1")
+
+    row = database.fetch_one(
+        "SELECT status,foutsoort,cache_reservering FROM job WHERE id=?", (job_id,)
+    )
+    assert row is not None and row["status"] == "mislukt"
+    assert row["foutsoort"] == "FileExistsError"
+    assert row["cache_reservering"] == 0
 
 
 def test_twee_claims_reserveren_samen_en_een_derde_wacht_eerlijk(tmp_path: Path) -> None:
@@ -209,7 +345,7 @@ def test_twee_claims_reserveren_samen_en_een_derde_wacht_eerlijk(tmp_path: Path)
     third, reason = planner.claim_next("cpu", "cpu-2")
 
     assert cpu_job is not None and gpu_job is not None
-    assert third is None and reason == "maximum actieve jobs bereikt"
+    assert third is None and reason is not None and "encodegrens van 2" in reason
     reservations = database.fetch_one(
         "SELECT SUM(cache_reservering) AS totaal FROM job WHERE status='bezig'"
     )
@@ -221,3 +357,58 @@ def test_twee_claims_reserveren_samen_en_een_derde_wacht_eerlijk(tmp_path: Path)
         )
     )
     assert reservations["totaal"] == expected
+
+
+def test_totale_encodegrens_is_direct_instelbaar_zonder_harde_ramgrens(tmp_path: Path) -> None:
+    database, configured, _job_ids = _planner_case(tmp_path)
+    database.execute(
+        "UPDATE instelling SET max_gelijktijdige_encodes=1 WHERE id=1"
+    )
+    planner = Planner(
+        database,
+        configured,
+        storage_validator=lambda: None,
+        machine_guard=lambda _lane: (True, None),
+    )
+
+    first, _ = planner.claim_next("gpu", "gpu-1")
+    second, reason = planner.claim_next("cpu", "cpu-1")
+
+    assert first is not None
+    assert second is None
+    assert reason is not None and "encodegrens van 1" in reason
+
+    database.execute(
+        "UPDATE instelling SET max_gelijktijdige_encodes=2 WHERE id=1"
+    )
+    second, reason = planner.claim_next("cpu", "cpu-1")
+
+    assert second is not None
+    assert reason is None
+
+
+@pytest.mark.asyncio
+async def test_plannerloop_overleeft_tijdelijke_sqlite_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, configured, _job_ids = _planner_case(tmp_path)
+    planner = Planner(
+        database,
+        configured,
+        storage_validator=lambda: None,
+        machine_guard=lambda _lane: (True, None),
+    )
+    calls = 0
+
+    async def flaky_tick() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        planner.stopping = True
+
+    monkeypatch.setattr(planner, "tick", flaky_tick)
+
+    await asyncio.wait_for(planner.run_forever(interval=0.001), timeout=1)
+
+    assert calls == 2

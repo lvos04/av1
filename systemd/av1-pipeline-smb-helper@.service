@@ -1,0 +1,19 @@
+[Unit]
+Description=AV1 Pipeline SMB-helperverzoek
+Requires=av1-pipeline-smb-helper.socket
+After=network-online.target
+CollectMode=inactive-or-failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/av1-pipeline-smb-helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=65
+SuccessExitStatus=1

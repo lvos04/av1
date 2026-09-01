@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import shutil
+import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, time
 from typing import Any
@@ -14,7 +15,9 @@ import psutil
 
 from app.config import Settings
 from app.db import Database
+from app.onderhoud import record_failure
 from app.uitvoerder import run_job
+from app.wachtrijherstel import QueueRecoveryError, remove_job_temporary_output
 
 Lane = str
 MachineGuard = Callable[[Lane], tuple[bool, str | None]]
@@ -75,9 +78,11 @@ def recover_orphaned_jobs(database: Database, settings: Settings) -> int:
         if alive:
             continue
         job_id = int(row["id"])
-        cache_dir = settings.cache_root / str(job_id)
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir)
+        try:
+            remove_job_temporary_output(settings, job_id)
+        except QueueRecoveryError as exc:
+            record_failure(database, job_id, str(exc), type(exc).__name__)
+            continue
         database.execute(
             """
             UPDATE job SET status='wacht',worker_id=NULL,proces_pid=NULL,
@@ -87,6 +92,23 @@ def recover_orphaned_jobs(database: Database, settings: Settings) -> int:
             (job_id,),
         )
         recovered += 1
+    # Een job met status 'wacht' kan bij een eerdere handmatige retry nog een
+    # deelbestand hebben. Bij backendstart bestaan er nog geen plannertaken,
+    # dus deze exacte numerieke jobmappen zijn aantoonbaar tijdelijk.
+    waiting = database.fetch_all("SELECT id FROM job WHERE status='wacht' ORDER BY id")
+    for row in waiting:
+        job_id = int(row["id"])
+        try:
+            removed = remove_job_temporary_output(settings, job_id)
+        except QueueRecoveryError as exc:
+            record_failure(database, job_id, str(exc), type(exc).__name__)
+            continue
+        if removed:
+            database.execute(
+                "UPDATE job SET proces_pid=NULL,worker_id=NULL,cache_reservering=0,percent=0 "
+                "WHERE id=? AND status='wacht'",
+                (job_id,),
+            )
     return recovered
 
 
@@ -109,6 +131,7 @@ class Planner:
         )
         self.tasks: dict[int, asyncio.Task[bool]] = {}
         self.stopping = False
+        self.next_lane: Lane = "cpu"
 
     def _lane_config(self, lane: Lane) -> Any:
         return self.database.fetch_one("SELECT * FROM worker_config WHERE baan=?", (lane,))
@@ -138,15 +161,21 @@ class Planner:
                     "SELECT COUNT(*) FROM job WHERE status IN ('bezig','verifieren')"
                 ).fetchone()[0]
             )
-            if active >= self.settings.max_active_jobs:
+            configured_limit = connection.execute(
+                "SELECT max_gelijktijdige_encodes FROM instelling WHERE id=1"
+            ).fetchone()
+            effective_max = int(configured_limit[0]) if configured_limit is not None else 1
+            if active >= effective_max:
                 connection.rollback()
-                return None, "maximum actieve jobs bereikt"
+                return None, (
+                    f"ingestelde totale encodegrens van {effective_max} actieve job(s) bereikt"
+                )
             row = connection.execute(
                 """
                 SELECT j.id,f.grootte,f.library_id,l.canary_status
                 FROM job j JOIN bestand f ON f.id=j.bestand_id
                 JOIN library l ON l.id=f.library_id
-                WHERE j.status='wacht' AND j.baan=?
+                WHERE j.status='wacht' AND j.baan=? AND l.actief=1
                 ORDER BY j.prioriteit DESC,j.id ASC LIMIT 1
                 """,
                 (lane,),
@@ -240,18 +269,44 @@ class Planner:
             if cursor.rowcount != 1:
                 connection.rollback()
                 return None, "job werd al door een andere planner geclaimd"
+            attempt = int(
+                connection.execute("SELECT pogingen FROM job WHERE id=?", (int(row["id"]),))
+                .fetchone()[0]
+            )
+            connection.execute(
+                """
+                INSERT INTO job_poging(job_id,poging,status,gestart_op)
+                VALUES (?,?,'bezig',?)
+                ON CONFLICT(job_id,poging) DO UPDATE SET
+                    status='bezig',gestart_op=excluded.gestart_op,klaar_op=NULL
+                """,
+                (int(row["id"]), attempt, datetime.now(UTC).isoformat()),
+            )
             connection.commit()
             return int(row["id"]), None
 
     async def _worker(self, job_id: int, worker_id: str) -> bool:
-        return await run_job(
-            self.database,
-            self.settings,
-            job_id,
-            worker_id=worker_id,
-            storage_validator=self.storage_validator,
-            already_claimed=True,
-        )
+        try:
+            return await run_job(
+                self.database,
+                self.settings,
+                job_id,
+                worker_id=worker_id,
+                storage_validator=self.storage_validator,
+                already_claimed=True,
+            )
+        except Exception as exc:
+            # Dit is de laatste procesgrens. Ook een fout vóór de normale
+            # uitvoerder-try (zoals een achtergebleven cachemap) mag de job
+            # nooit stil als 'bezig' achterlaten.
+            LOGGER.exception("Worker voor job %s faalde buiten de uitvoerder", job_id)
+            record_failure(self.database, job_id, str(exc), type(exc).__name__)
+            return False
+        finally:
+            self.database.execute(
+                "UPDATE job SET cache_reservering=0,proces_pid=NULL WHERE id=?",
+                (job_id,),
+            )
 
     def _remove_done(self) -> None:
         for job_id, task in list(self.tasks.items()):
@@ -278,7 +333,10 @@ class Planner:
             )
             for row in rows:
                 active_by_lane[str(row["baan"])] = int(row["aantal"])
-        for lane in ("cpu", "gpu"):
+        lane_order: tuple[Lane, Lane] = (
+            ("cpu", "gpu") if self.next_lane == "cpu" else ("gpu", "cpu")
+        )
+        for lane in lane_order:
             config = self._lane_config(lane)
             desired = int(config["aantal"]) if config is not None else 1
             for slot in range(active_by_lane[lane], desired):
@@ -286,12 +344,29 @@ class Planner:
                 job_id, _reason = self.claim_next(lane, worker_id)
                 if job_id is None:
                     break
+                # Bij een totale grens van één zou een vaste CPU-eerstvolgorde
+                # de GPU onbeperkt laten wachten zolang er CPU-opruimjobs zijn.
+                # Onthoud daarom uitsluitend na een geslaagde claim welke baan
+                # de volgende kans krijgt; gepauzeerde of lege banen blokkeren
+                # de andere baan niet.
+                self.next_lane = "gpu" if lane == "cpu" else "cpu"
                 self.tasks[job_id] = asyncio.create_task(self._worker(job_id, worker_id))
 
     async def run_forever(self, interval: float = 0.5) -> None:
         recover_orphaned_jobs(self.database, self.settings)
         while not self.stopping:
-            await self.tick()
+            try:
+                await self.tick()
+            except sqlite3.OperationalError as exc:
+                # Een scan of API-mutatie kan heel kort de SQLite-schrijver
+                # bezetten. Dat is een tijdelijke wachtrijtoestand en mag de
+                # permanente planner nooit definitief uitschakelen.
+                LOGGER.warning("Planner wacht op SQLite en probeert opnieuw: %s", exc)
+            except Exception:
+                # De planner is een permanente veiligheidscomponent. Een fout
+                # in één tick wordt gelogd; een volgende tick kan daarna weer
+                # veilig atomisch claimen.
+                LOGGER.exception("Planner-tick stopte onverwacht; nieuwe poging volgt")
             await asyncio.sleep(interval)
         if self.tasks:
             await asyncio.gather(*self.tasks.values(), return_exceptions=True)

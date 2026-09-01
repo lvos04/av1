@@ -1,17 +1,23 @@
 [Unit]
 Description=AV1 Pipeline frontend
 After=network-online.target av1-pipeline-backend.service
-Wants=network-online.target
+Wants=network-online.target av1-pipeline-backend.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=av1frontend
 Group=av1frontend
 Environment=NODE_ENV=production
+Environment=LAN_LISTEN_HOST=0.0.0.0
+Environment=PORT=3000
+Environment=BACKEND_URL=http://127.0.0.1:8000
 WorkingDirectory=__PROJECT_DIR__/frontend
-ExecStart=/usr/bin/npm run start -- --hostname 127.0.0.1 --port 3000
-Restart=on-failure
+ExecStart=/usr/bin/npm run start
+Restart=always
 RestartSec=5
+KillMode=control-group
+TimeoutStopSec=45
 UMask=0027
 NoNewPrivileges=true
 PrivateTmp=true

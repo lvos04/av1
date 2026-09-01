@@ -6,28 +6,53 @@ import asyncio
 import json
 import sqlite3
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query, Request, status
+import psutil
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app import __version__
+from app.ai_controller import (
+    AI_ACTIVE_CONFIRMATION,
+    AI_SECRET_KEY,
+    HDR10_CONFIRMATION,
+    AiController,
+    revoke_ai_consent,
+)
 from app.backups import BackupError, create_backup
 from app.backups import verify_backup as verify_backup_copy
+from app.bronnen import (
+    SourceError,
+    ensure_smb_mount,
+    parse_smb_location,
+    resolve_local_source,
+    test_source,
+)
 from app.config import Settings
 from app.db import Database
 from app.geheimen import SecretError, SecretStore
 from app.health import dependency_report
 from app.kwaliteit import (
+    dolby_vision_overview,
     quality_directory,
     run_profile_trial,
     trial_overview,
     verification_overview,
     vmaf_available,
+)
+from app.lan import (
+    LAN_CONFIRMATION,
+    LanConfigError,
+    authorization_matches,
+    hash_password,
+    lan_urls,
+    validate_username,
 )
 from app.media.beslissen import STANDAARD, Besluit, beslis
 from app.opslag import (
@@ -40,8 +65,19 @@ from app.opslag import (
     transient_storage_is_empty,
 )
 from app.scanner import ScanError, scan_library
+from app.scanscheduler import LibraryScanScheduler, record_scan_failure
 from app.systeem import GpuMonitor, mount_report, qsv_test, system_metrics
 from app.uitvoerder import ExecutionError, create_job_from_decision
+from app.wachtrijherstel import (
+    QueueRecoveryError,
+    media_process_alive,
+    queue_recovery_report,
+    recover_queue,
+    remove_job_quality_output,
+    remove_job_temporary_output,
+)
+
+LIBRARY_DELETE_CONFIRMATION = "BIBLIOTHEEK VERWIJDEREN"
 
 
 class StrictModel(BaseModel):
@@ -50,17 +86,46 @@ class StrictModel(BaseModel):
 
 class LibraryCreate(StrictModel):
     naam: str = Field(min_length=1, max_length=120)
-    pad: str
+    pad: str | None = None
+    locatie: str | None = None
+    smb_gebruikersnaam: str | None = Field(default=None, max_length=256)
+    smb_wachtwoord: str | None = Field(default=None, max_length=1024)
+    smb_gast: bool = False
     profiel_id: int
-    scan_interval: int = Field(default=86400, ge=300)
+    scan_interval: Literal[0, 86400, 604800] = 86400
+    scan_tijd: str = "03:00"
+
+    @field_validator("scan_tijd")
+    @classmethod
+    def validate_scan_time(cls, value: str) -> str:
+        try:
+            parsed = time.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError("Scantijd moet UU:MM zijn") from exc
+        if parsed.second or parsed.microsecond:
+            raise ValueError("Scantijd mag alleen uren en minuten bevatten")
+        return parsed.strftime("%H:%M")
 
 
 class LibraryPatch(StrictModel):
     naam: str | None = Field(default=None, min_length=1, max_length=120)
     profiel_id: int | None = None
-    scan_interval: int | None = Field(default=None, ge=300)
+    scan_interval: Literal[0, 86400, 604800] | None = None
+    scan_tijd: str | None = None
     actief: bool | None = None
-    canary_status: Literal["actief", "vrijgegeven"] | None = None
+
+    @field_validator("scan_tijd")
+    @classmethod
+    def validate_scan_time(cls, value: str | None) -> str | None:
+        return LibraryCreate.validate_scan_time(value) if value is not None else None
+
+
+class LibraryDelete(StrictModel):
+    bevestiging: str
+
+
+class CanaryRelease(StrictModel):
+    bevestiging: str
 
 
 class ProfileCreate(StrictModel):
@@ -114,10 +179,14 @@ class JobPatch(StrictModel):
 
 
 class WorkerPatch(StrictModel):
-    aantal: int | None = Field(default=None, ge=0, le=4)
+    aantal: int | None = Field(default=None, ge=0)
     nice: int | None = Field(default=None, ge=-20, le=19)
     stilte_start: str | None = None
     stilte_einde: str | None = None
+
+
+class QueueRecoveryRequest(StrictModel):
+    bevestiging: str
 
 
 class SettingsPatch(StrictModel):
@@ -126,12 +195,24 @@ class SettingsPatch(StrictModel):
     log_niveau: Literal["debug", "info", "warning", "error"] | None = None
     cpu_max_percent: int | None = Field(default=None, ge=10, le=100)
     cpu_max_temperatuur: int | None = Field(default=None, ge=40, le=110)
+    max_gelijktijdige_encodes: int | None = Field(default=None, ge=1)
     cache_waarschuwing_gb: int | None = Field(default=None, ge=1)
     cache_pauze_gb: int | None = Field(default=None, ge=1)
     hardlink_modus: Literal["overslaan", "verbreek_na_bevestiging"] | None = None
     meld_browser_fouten: bool | None = None
     meld_browser_batches: bool | None = None
     pauzeer_cpu_bij_kijken: bool | None = None
+
+    @field_validator("tijdzone")
+    @classmethod
+    def validate_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("Onbekende IANA-tijdzone") from exc
+        return value
 
 
 class StorageChoice(StrictModel):
@@ -151,6 +232,13 @@ class FeaturePatch(StrictModel):
     bevestiging: str | None = None
 
 
+class LanAccessPatch(StrictModel):
+    ingeschakeld: bool
+    gebruikersnaam: str | None = Field(default=None, min_length=3, max_length=64)
+    wachtwoord: str | None = Field(default=None, min_length=12, max_length=128)
+    bevestiging: str | None = None
+
+
 class IntegrationTest(StrictModel):
     url: str | None = None
     api_sleutel: str | None = Field(default=None, min_length=1)
@@ -160,6 +248,17 @@ class IntegrationConfig(StrictModel):
     url: str | None = None
     api_sleutel: str | None = Field(default=None, min_length=1)
     verwijder_sleutel: bool = False
+
+
+class AiConfigPatch(StrictModel):
+    ingeschakeld: bool
+    modus: Literal["schaduw", "actief"]
+    maandbudget_usd: float = Field(default=10.0, ge=0.10, le=100.0)
+    api_sleutel: str | None = Field(default=None, min_length=20, max_length=500)
+    verwijder_sleutel: bool = False
+    hdr10_vrijgegeven: bool = False
+    bevestiging: str | None = None
+    hdr10_bevestiging: str | None = None
 
 
 def _database(request: Request) -> Database:
@@ -174,9 +273,86 @@ def _gpu(request: Request) -> GpuMonitor:
     return cast(GpuMonitor, request.app.state.gpu_monitor)
 
 
+def _scheduler(request: Request) -> LibraryScanScheduler:
+    return cast(LibraryScanScheduler, request.app.state.scan_scheduler)
+
+
+def _ai_controller(request: Request) -> AiController:
+    return cast(AiController, request.app.state.ai_controller)
+
+
 def _json_object(value: str) -> dict[str, Any]:
     parsed = json.loads(value)
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _canary_report(database: Database, library_id: int) -> dict[str, Any]:
+    library = _get_row(database, "library", library_id)
+    feature = database.fetch_one(
+        "SELECT ingeschakeld,configuratie FROM functie WHERE sleutel='canary_limiet'"
+    )
+    configuration = (
+        _json_object(str(feature["configuratie"])) if feature is not None else {}
+    )
+    limits = {
+        "max_bestanden": int(configuration.get("max_bestanden", 50)),
+        "max_gb": int(configuration.get("max_gb", 100)),
+        "max_jobs_per_dag": int(configuration.get("max_jobs_per_dag", 10)),
+    }
+    summary = database.fetch_one(
+        """
+        SELECT COUNT(j.id) AS totaal,
+               SUM(CASE WHEN j.status='klaar' THEN 1 ELSE 0 END) AS klaar,
+               SUM(CASE WHEN j.status='wacht' THEN 1 ELSE 0 END) AS wacht,
+               SUM(CASE WHEN j.status IN ('bezig','verifieren') THEN 1 ELSE 0 END) AS actief,
+               SUM(CASE WHEN j.status='mislukt' THEN 1 ELSE 0 END) AS mislukt,
+               SUM(CASE WHEN v.geslaagd=1 THEN 1 ELSE 0 END) AS verificaties_ok,
+               SUM(CASE WHEN v.geslaagd=0 THEN 1 ELSE 0 END) AS verificaties_mislukt,
+               COALESCE(SUM(CASE WHEN j.status='klaar'
+                                 THEN COALESCE(j.bron_grootte,f.grootte) ELSE 0 END),0)
+                   AS bron_bytes,
+               COALESCE(SUM(CASE WHEN j.status='klaar'
+                                 THEN COALESCE(j.resultaat_grootte,0) ELSE 0 END),0)
+                   AS resultaat_bytes,
+               SUM(CASE WHEN date(j.gestart_op)=date('now') THEN 1 ELSE 0 END) AS vandaag
+        FROM job j JOIN bestand f ON f.id=j.bestand_id
+        LEFT JOIN verificatie v ON v.job_id=j.id
+        WHERE f.library_id=?
+        """,
+        (library_id,),
+    )
+    assert summary is not None
+    completed = int(summary["klaar"] or 0)
+    source_bytes = int(summary["bron_bytes"] or 0)
+    today = int(summary["vandaag"] or 0)
+    limit_reached = (
+        completed >= limits["max_bestanden"]
+        or source_bytes >= limits["max_gb"] * 1024**3
+        or today >= limits["max_jobs_per_dag"]
+    )
+    return {
+        "library_id": library_id,
+        "status": str(library["canary_status"]),
+        "ingeschakeld": bool(feature is not None and int(feature["ingeschakeld"])),
+        "limieten": limits,
+        "limiet_bereikt": limit_reached,
+        "totaal_jobs": int(summary["totaal"] or 0),
+        "klaar": completed,
+        "wacht": int(summary["wacht"] or 0),
+        "actief": int(summary["actief"] or 0),
+        "mislukt": int(summary["mislukt"] or 0),
+        "verificaties_ok": int(summary["verificaties_ok"] or 0),
+        "verificaties_mislukt": int(summary["verificaties_mislukt"] or 0),
+        "bron_bytes": source_bytes,
+        "resultaat_bytes": int(summary["resultaat_bytes"] or 0),
+        "bespaard_bytes": max(0, source_bytes - int(summary["resultaat_bytes"] or 0)),
+        "vandaag": today,
+        "kan_vrijgeven": (
+            str(library["canary_status"]) == "actief"
+            and completed > 0
+            and int(summary["actief"] or 0) == 0
+        ),
+    }
 
 
 def _profile_settings(value: dict[str, Any]) -> dict[str, Any]:
@@ -193,18 +369,77 @@ def _profile_settings(value: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _safe_library_path(settings: Settings, raw: str) -> Path:
-    path = Path(raw)
-    if not path.is_absolute():
-        raise HTTPException(422, "Librarypad moet absoluut zijn")
+def _hdr_autonomy_readiness(database: Database) -> dict[str, Any]:
+    rows = database.fetch_all(
+        """
+        SELECT b.encoder,
+               SUM(CASE WHEN v.geslaagd=1 AND v.hdr_bron=1 AND v.hdr_resultaat=1
+                         AND v.md_gelijk=1 THEN 1 ELSE 0 END) AS geslaagd,
+               SUM(CASE WHEN v.hdr_bron=1 AND (v.geslaagd=0 OR v.hdr_resultaat!=1
+                         OR v.md_gelijk!=1) THEN 1 ELSE 0 END) AS afwijkingen
+        FROM verificatie v JOIN job j ON j.id=v.job_id
+        JOIN besluit b ON b.id=j.besluit_id
+        WHERE b.encoder IN ('libsvtav1','av1_qsv')
+        GROUP BY b.encoder
+        """
+    )
+    counts = {
+        str(row["encoder"]): {
+            "geslaagd": int(row["geslaagd"] or 0),
+            "afwijkingen": int(row["afwijkingen"] or 0),
+        }
+        for row in rows
+    }
+    cpu = counts.get("libsvtav1", {"geslaagd": 0, "afwijkingen": 0})
+    qsv = counts.get("av1_qsv", {"geslaagd": 0, "afwijkingen": 0})
+    ready = (
+        cpu["geslaagd"] > 0
+        and qsv["geslaagd"] > 0
+        and cpu["afwijkingen"] == 0
+        and qsv["afwijkingen"] == 0
+    )
+    return {
+        "gereed": ready,
+        "cpu": cpu,
+        "qsv": qsv,
+        "tv_test_vereist": False,
+        "uitleg": (
+            "CPU en QSV vereisen ieder minstens één exact teruggelezen HDR10-test; "
+            "iedere metadata-afwijking blokkeert autonomie. De bewuste keuze zonder "
+            "tv-test wordt bij vrijgave geaudit."
+        ),
+    }
+
+
+async def _prepare_library_source(
+    settings: Settings, body: LibraryCreate
+) -> tuple[Path, Literal["lokaal", "smb"], str, dict[str, Any]]:
+    if bool(body.pad) == bool(body.locatie):
+        raise HTTPException(422, "Geef precies pad (oud) of locatie op")
+    raw = (body.locatie or body.pad or "").strip()
     try:
-        resolved = path.resolve(strict=True)
-        root = settings.library_root.resolve(strict=True)
-    except OSError as exc:
-        raise HTTPException(422, f"Librarypad is niet toegankelijk: {exc}") from exc
-    if not resolved.is_dir() or not resolved.is_relative_to(root):
-        raise HTTPException(422, f"Library moet een map binnen {root} zijn")
-    return resolved
+        if raw.lower().startswith("smb://"):
+            location = parse_smb_location(raw)
+            mount_path = await asyncio.to_thread(
+                ensure_smb_mount,
+                location,
+                username=body.smb_gebruikersnaam,
+                password=body.smb_wachtwoord,
+                guest=body.smb_gast,
+            )
+            path = resolve_local_source(settings, str(mount_path))
+            source_type: Literal["lokaal", "smb"] = "smb"
+            source_uri = location.uri
+        else:
+            if body.smb_gebruikersnaam or body.smb_wachtwoord or body.smb_gast:
+                raise SourceError("SMB-accountvelden horen alleen bij een smb://-locatie")
+            path = resolve_local_source(settings, raw)
+            source_type = "lokaal"
+            source_uri = str(path)
+        report = await asyncio.to_thread(test_source, path)
+    except SourceError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return path, source_type, source_uri, report
 
 
 def _get_row(database: Database, table: str, row_id: int) -> Any:
@@ -274,21 +509,31 @@ def _task_id(request: Request, task: asyncio.Task[Any], identifier: str | None =
 async def _scan_background(database: Database, library_id: int, dry_run: bool) -> None:
     try:
         await asyncio.to_thread(scan_library, database, library_id, dry_run=dry_run)
-    except ScanError:
+    except ScanError as exc:
         # De scan_run bevat bij een gewone scan de hervatbare toestand; de UI
         # haalt de concrete fout via diagnose/logging op.
         if not dry_run:
-            database.execute(
-                "UPDATE scan_run SET status='mislukt',fout=? "
-                "WHERE id=(SELECT id FROM scan_run WHERE library_id=? ORDER BY id DESC LIMIT 1)",
-                ("scan mislukt; controleer het librarypad", library_id),
-            )
+            record_scan_failure(database, library_id, str(exc))
 
 
 def _worker_rows(database: Database) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
+    memory = psutil.virtual_memory()
+    limit_row = database.fetch_one(
+        "SELECT max_gelijktijdige_encodes FROM instelling WHERE id=1"
+    )
+    total_limit = int(limit_row["max_gelijktijdige_encodes"]) if limit_row else 1
     for row in database.fetch_all("SELECT * FROM worker_config ORDER BY baan"):
         item = _as_bool_fields(dict(row))
+        item["veilige_max_workers"] = total_limit
+        item["totaal_max_actieve_jobs"] = total_limit
+        item["geheugen_totaal_bytes"] = int(memory.total)
+        item["geheugen_beschikbaar_bytes"] = int(memory.available)
+        item["veiligheidsuitleg"] = (
+            f"De totale encodegrens staat op {total_limit}. Op deze 15-GiB-host is 1 "
+            "aanbevolen. Na een RAM-upgrade kun je de grens en worker-aantallen verhogen. "
+            "Een mislukte job krijgt maximaal één automatische herstelpoging."
+        )
         active = database.fetch_all(
             """
             SELECT j.id AS job_id,j.percent,j.fps,j.speed,j.eta_seconden,j.bitrate_kbps,
@@ -346,35 +591,87 @@ def create_api_router() -> APIRouter:
     async def libraries(request: Request) -> list[dict[str, Any]]:
         rows = _database(request).fetch_all(
             """
-            SELECT l.*,p.naam AS profiel_naam,COUNT(f.id) AS aantal_bestanden,
-                   COALESCE(SUM(f.grootte),0) AS totale_grootte,
-                   SUM(CASE WHEN b.status IN ('ingepland','goedgekeurd') OR j.status='klaar'
-                            THEN 1 ELSE 0 END) AS verwerkt
+            SELECT l.*,p.naam AS profiel_naam,
+                   (SELECT COUNT(*) FROM bestand f
+                    WHERE f.library_id=l.id AND f.aanwezig=1) AS aantal_bestanden,
+                   (SELECT COALESCE(SUM(f.grootte),0) FROM bestand f
+                    WHERE f.library_id=l.id AND f.aanwezig=1) AS totale_grootte,
+                   (SELECT COALESCE(SUM(s.bytes_voor-s.bytes_na),0) FROM besparing s
+                    WHERE s.library_id=l.id) AS bespaard_bytes,
+                   (SELECT COALESCE(SUM(s.bytes_voor),0) FROM besparing s
+                    WHERE s.library_id=l.id) AS verwerkte_bron_bytes,
+                   (SELECT COUNT(*) FROM job j JOIN bestand f ON f.id=j.bestand_id
+                    WHERE f.library_id=l.id AND j.status='klaar') AS verwerkt,
+                   (SELECT COUNT(*) FROM bestand f WHERE f.library_id=l.id
+                    AND f.scan_status='wacht_op_stabiliteit') AS stabiliteitswachtrij,
+                   COALESCE((SELECT s.nieuw FROM scan_run s WHERE s.library_id=l.id
+                    ORDER BY s.id DESC LIMIT 1),0) AS laatste_scan_nieuw,
+                   COALESCE((SELECT s.gewijzigd FROM scan_run s WHERE s.library_id=l.id
+                    ORDER BY s.id DESC LIMIT 1),0) AS laatste_scan_gewijzigd,
+                   COALESCE((SELECT s.verdwenen FROM scan_run s WHERE s.library_id=l.id
+                    ORDER BY s.id DESC LIMIT 1),0) AS laatste_scan_verdwenen,
+                   (SELECT COUNT(*) FROM besluit b JOIN bestand f ON f.id=b.bestand_id
+                    WHERE f.library_id=l.id AND b.goedkeuringsbron='ai_policy'
+                    AND b.status IN ('goedgekeurd','ingepland')) AS ai_goedgekeurd,
+                   (SELECT COUNT(*) FROM besluit b JOIN bestand f ON f.id=b.bestand_id
+                    LEFT JOIN ai_analyse a ON a.id=b.ai_analyse_id
+                    WHERE f.library_id=l.id AND b.status='nieuw'
+                    AND (a.id IS NULL
+                         OR (a.modus='schaduw'
+                             AND a.policy_uitkomst NOT LIKE 'geblokkeerd:%')
+                         OR a.policy_uitkomst LIKE 'mens nodig:%'))
+                    AS handmatig_wachtend,
+                   (SELECT COUNT(*) FROM besluit b JOIN bestand f ON f.id=b.bestand_id
+                    JOIN ai_analyse a ON a.id=b.ai_analyse_id
+                    WHERE f.library_id=l.id AND b.status='nieuw'
+                    AND a.policy_uitkomst LIKE 'geblokkeerd:%') AS ai_geblokkeerd
             FROM library l JOIN profiel p ON p.id=l.profiel_id
-            LEFT JOIN bestand f ON f.library_id=l.id
-            LEFT JOIN besluit b ON b.bestand_id=f.id
-            LEFT JOIN job j ON j.besluit_id=b.id
-            GROUP BY l.id ORDER BY l.naam
+            ORDER BY l.naam
             """
         )
-        return [_as_bool_fields(dict(row)) for row in rows]
+        result = []
+        for row in rows:
+            item = _as_bool_fields(dict(row))
+            item["bron_controle"] = (
+                _json_object(str(item["bron_controle"])) if item.get("bron_controle") else None
+            )
+            result.append(item)
+        return result
 
     @router.post("/libraries", status_code=status.HTTP_201_CREATED)
     async def add_library(body: LibraryCreate, request: Request) -> dict[str, Any]:
         database = _database(request)
         _get_row(database, "profiel", body.profiel_id)
-        path = _safe_library_path(_settings(request), body.pad)
+        path, source_type, source_uri, source_report = await _prepare_library_source(
+            _settings(request), body
+        )
         try:
             row_id = database.execute_insert(
                 """
-                INSERT INTO library(naam,pad,profiel_id,scan_interval,verwacht_device)
-                VALUES (?,?,?,?,?)
+                INSERT INTO library(
+                    naam,pad,profiel_id,scan_interval,scan_tijd,verwacht_device,
+                    bron_type,bron_uri,bron_controle,bron_gecontroleerd_op
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
-                (body.naam, str(path), body.profiel_id, body.scan_interval, path.stat().st_dev),
+                (
+                    body.naam,
+                    str(path),
+                    body.profiel_id,
+                    body.scan_interval,
+                    body.scan_tijd,
+                    path.stat().st_dev,
+                    source_type,
+                    source_uri,
+                    json.dumps(source_report, ensure_ascii=False),
+                    datetime.now(UTC).isoformat(),
+                ),
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, "Deze library bestaat al") from exc
-        return dict(_get_row(database, "library", row_id))
+        _scheduler(request).schedule_library(row_id)
+        result = dict(_get_row(database, "library", row_id))
+        result["bron_controle"] = source_report
+        return result
 
     @router.patch("/libraries/{library_id}")
     async def update_library(
@@ -391,13 +688,359 @@ def create_api_router() -> APIRouter:
         database.execute(
             f"UPDATE library SET {assignments} WHERE id=?", (*values.values(), library_id)
         )
+        if {"scan_interval", "scan_tijd", "actief"} & set(values):
+            _scheduler(request).schedule_library(library_id)
+        if "profiel_id" in values:
+            revoke_ai_consent(
+                database,
+                library_ids=[library_id],
+                reason="AI-toestemming ingetrokken door gewijzigd libraryprofiel",
+            )
         return _as_bool_fields(dict(_get_row(database, "library", library_id)))
 
+    @router.delete("/libraries/{library_id}")
+    async def delete_library(
+        library_id: int, body: LibraryDelete, request: Request
+    ) -> dict[str, Any]:
+        """Verwijder pipelineadministratie zonder ooit het bronpad aan te raken."""
+
+        if body.bevestiging != LIBRARY_DELETE_CONFIRMATION:
+            raise HTTPException(
+                409,
+                f"Typ ter bevestiging exact: {LIBRARY_DELETE_CONFIRMATION}",
+            )
+        database = _database(request)
+        task_prefix = f"library-{library_id}-"
+
+        def active_background_tasks() -> list[str]:
+            return [
+                identifier
+                for identifier, task in request.app.state.background_tasks.items()
+                if identifier.startswith(task_prefix) and not task.done()
+            ]
+
+        if active_background_tasks():
+            raise HTTPException(
+                409,
+                "Deze bibliotheek heeft nog een actieve scan of proefdraai; "
+                "wacht tot die klaar is",
+            )
+        if _scheduler(request).current_library_id == library_id:
+            raise HTTPException(409, "De geplande scan van deze bibliotheek is nog actief")
+
+        planner_tasks = getattr(request.app.state.planner, "tasks", {})
+        active_planner_ids = {
+            int(job_id) for job_id, task in planner_tasks.items() if not task.done()
+        }
+        with database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            library = connection.execute(
+                "SELECT * FROM library WHERE id=?", (library_id,)
+            ).fetchone()
+            if library is None:
+                connection.rollback()
+                raise HTTPException(404, "Bibliotheek niet gevonden")
+            jobs = connection.execute(
+                "SELECT j.id,j.status,j.proces_pid FROM job j "
+                "JOIN bestand f ON f.id=j.bestand_id WHERE f.library_id=? ORDER BY j.id",
+                (library_id,),
+            ).fetchall()
+            active_jobs = [
+                int(row["id"])
+                for row in jobs
+                if str(row["status"]) in {"bezig", "verifieren"}
+                or int(row["id"]) in active_planner_ids
+                or media_process_alive(
+                    int(row["proces_pid"]) if row["proces_pid"] is not None else None
+                )
+            ]
+            if active_jobs:
+                connection.rollback()
+                raise HTTPException(
+                    409,
+                    "Stop of herstel eerst de actieve jobs van deze bibliotheek: "
+                    + ", ".join(f"#{job_id}" for job_id in active_jobs),
+                )
+            active_scan = connection.execute(
+                "SELECT id FROM scan_run WHERE library_id=? AND status='bezig' LIMIT 1",
+                (library_id,),
+            ).fetchone()
+            if active_scan is not None:
+                connection.rollback()
+                raise HTTPException(409, "Deze bibliotheek wordt nog gescand")
+            unsafe_replacement = connection.execute(
+                """
+                SELECT v.id FROM vervang_transactie v
+                JOIN job j ON j.id=v.job_id
+                JOIN bestand f ON f.id=j.bestand_id
+                WHERE f.library_id=?
+                  AND v.status NOT IN ('hersteld','opgeruimd')
+                  AND NOT (v.status='vervangen' AND j.status='klaar')
+                LIMIT 1
+                """,
+                (library_id,),
+            ).fetchone()
+            if unsafe_replacement is not None:
+                connection.rollback()
+                raise HTTPException(
+                    409,
+                    "Deze bibliotheek heeft een onafgeronde vervanging; "
+                    "los die eerst op onder Systeem",
+                )
+
+            # Inactief zetten sluit planner, scheduler en AI-controller af voordat
+            # lokale pipeline-output buiten de transactie wordt opgeruimd.
+            now = datetime.now(UTC).isoformat()
+            connection.execute(
+                "UPDATE library SET actief=0,volgende_scan=NULL WHERE id=?",
+                (library_id,),
+            )
+            connection.execute(
+                """
+                UPDATE job
+                SET status='afgebroken',fout='bibliotheek uit pipeline verwijderd',
+                    foutsoort='LibraryVerwijderd',klaar_op=?,proces_pid=NULL,
+                    worker_id=NULL,cache_reservering=0
+                WHERE status IN ('wacht','mislukt')
+                  AND bestand_id IN (SELECT id FROM bestand WHERE library_id=?)
+                """,
+                (now, library_id),
+            )
+            connection.execute(
+                """
+                UPDATE besluit
+                SET status='afgewezen',reden=reden || '; bibliotheek uit pipeline verwijderd'
+                WHERE status IN ('nieuw','goedgekeurd','ingepland')
+                  AND bestand_id IN (SELECT id FROM bestand WHERE library_id=?)
+                """,
+                (library_id,),
+            )
+            connection.commit()
+
+        removed_paths = 0
+        try:
+            for row in jobs:
+                job_id = int(row["id"])
+                removed_paths += len(
+                    remove_job_temporary_output(_settings(request), job_id)
+                )
+                removed_paths += len(remove_job_quality_output(_settings(request), job_id))
+        except QueueRecoveryError as exc:
+            raise HTTPException(
+                409,
+                "De bibliotheek is veilig uitgezet, maar lokale pipeline-output kon "
+                f"niet volledig worden opgeruimd: {exc}. Probeer verwijderen opnieuw.",
+            ) from exc
+
+        if active_background_tasks() or _scheduler(request).current_library_id == library_id:
+            raise HTTPException(
+                409,
+                "De bibliotheek is veilig uitgezet, maar er werd nog een achtergrondtaak "
+                "gevonden; probeer verwijderen opnieuw zodra die klaar is",
+            )
+
+        with database.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT naam,pad,bron_type,bron_uri,actief FROM library WHERE id=?",
+                (library_id,),
+            ).fetchone()
+            if current is None:
+                connection.rollback()
+                raise HTTPException(404, "Bibliotheek niet gevonden")
+            if int(current["actief"]):
+                connection.rollback()
+                raise HTTPException(
+                    409,
+                    "De bibliotheek is intussen opnieuw geactiveerd; verwijderen is gestopt",
+                )
+            if connection.execute(
+                "SELECT 1 FROM scan_run WHERE library_id=? AND status='bezig' LIMIT 1",
+                (library_id,),
+            ).fetchone():
+                connection.rollback()
+                raise HTTPException(409, "De bibliotheek is intussen opnieuw gaan scannen")
+            if connection.execute(
+                """
+                SELECT 1 FROM job j JOIN bestand f ON f.id=j.bestand_id
+                WHERE f.library_id=? AND j.status IN ('bezig','verifieren') LIMIT 1
+                """,
+                (library_id,),
+            ).fetchone():
+                connection.rollback()
+                raise HTTPException(409, "De bibliotheek heeft intussen een actieve job")
+
+            counts = {
+                "bestanden": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM bestand WHERE library_id=?", (library_id,)
+                    ).fetchone()[0]
+                ),
+                "besluiten": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM besluit WHERE bestand_id IN "
+                        "(SELECT id FROM bestand WHERE library_id=?)",
+                        (library_id,),
+                    ).fetchone()[0]
+                ),
+                "jobs": len(jobs),
+                "scans": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM scan_run WHERE library_id=?", (library_id,)
+                    ).fetchone()[0]
+                ),
+                "ai_analyses": int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM ai_analyse
+                        WHERE library_id=?
+                           OR job_id IN (
+                               SELECT j.id FROM job j JOIN bestand f ON f.id=j.bestand_id
+                               WHERE f.library_id=?
+                           )
+                           OR besluit_id IN (
+                               SELECT b.id FROM besluit b JOIN bestand f ON f.id=b.bestand_id
+                               WHERE f.library_id=?
+                           )
+                        """,
+                        (library_id, library_id, library_id),
+                    ).fetchone()[0]
+                ),
+            }
+
+            connection.execute(
+                "UPDATE besluit SET ai_analyse_id=NULL WHERE bestand_id IN "
+                "(SELECT id FROM bestand WHERE library_id=?)",
+                (library_id,),
+            )
+            connection.execute(
+                "UPDATE job_poging SET ai_analyse_id=NULL WHERE job_id IN "
+                "(SELECT j.id FROM job j JOIN bestand f ON f.id=j.bestand_id "
+                "WHERE f.library_id=?)",
+                (library_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM ai_analyse
+                WHERE library_id=?
+                   OR job_id IN (
+                       SELECT j.id FROM job j JOIN bestand f ON f.id=j.bestand_id
+                       WHERE f.library_id=?
+                   )
+                   OR besluit_id IN (
+                       SELECT b.id FROM besluit b JOIN bestand f ON f.id=b.bestand_id
+                       WHERE f.library_id=?
+                   )
+                """,
+                (library_id, library_id, library_id),
+            )
+            for table in ("verificatie", "vervang_transactie", "logregel", "job_poging"):
+                connection.execute(
+                    f"DELETE FROM {table} WHERE job_id IN "
+                    "(SELECT j.id FROM job j JOIN bestand f ON f.id=j.bestand_id "
+                    "WHERE f.library_id=?)",
+                    (library_id,),
+                )
+            connection.execute(
+                """
+                DELETE FROM kwaliteitsmeting
+                WHERE bestand_id IN (SELECT id FROM bestand WHERE library_id=?)
+                   OR job_id IN (
+                       SELECT j.id FROM job j JOIN bestand f ON f.id=j.bestand_id
+                       WHERE f.library_id=?
+                   )
+                """,
+                (library_id, library_id),
+            )
+            connection.execute(
+                "DELETE FROM besparing WHERE library_id=? OR job_id IN "
+                "(SELECT j.id FROM job j JOIN bestand f ON f.id=j.bestand_id "
+                "WHERE f.library_id=?)",
+                (library_id, library_id),
+            )
+            connection.execute(
+                "DELETE FROM job WHERE bestand_id IN "
+                "(SELECT id FROM bestand WHERE library_id=?)",
+                (library_id,),
+            )
+            connection.execute(
+                "DELETE FROM besluit WHERE bestand_id IN "
+                "(SELECT id FROM bestand WHERE library_id=?)",
+                (library_id,),
+            )
+            connection.execute("DELETE FROM bestand WHERE library_id=?", (library_id,))
+            connection.execute("DELETE FROM scan_run WHERE library_id=?", (library_id,))
+            connection.execute("DELETE FROM library WHERE id=?", (library_id,))
+            audit = {
+                "naam": str(current["naam"]),
+                "pad": str(current["pad"]),
+                "bron_uri": str(current["bron_uri"] or ""),
+                "bron_ongemoeid": True,
+                "smb_mount_behouden": str(current["bron_type"]) == "smb",
+                "verwijderd": counts,
+                "lokale_pipeline_mappen": removed_paths,
+            }
+            connection.execute(
+                "INSERT INTO auditlog(soort,onderwerp,oud,nieuw,tijd) "
+                "VALUES ('bibliotheek','verwijderd',?,NULL,?)",
+                (json.dumps(audit, ensure_ascii=False), datetime.now(UTC).isoformat()),
+            )
+            connection.commit()
+
+        return {
+            "id": library_id,
+            "naam": str(current["naam"]),
+            "verwijderd": True,
+            "bron_ongemoeid": True,
+            "mediapad_verwijderd": False,
+            "smb_mount_behouden": str(current["bron_type"]) == "smb",
+            "pipeline_records": counts,
+            "lokale_pipeline_mappen_verwijderd": removed_paths,
+        }
+
+    @router.get("/libraries/{library_id}/canary")
+    async def canary_report(library_id: int, request: Request) -> dict[str, Any]:
+        return _canary_report(_database(request), library_id)
+
+    @router.post("/libraries/{library_id}/canary-vrijgeven")
+    async def release_canary(
+        library_id: int, body: CanaryRelease, request: Request
+    ) -> dict[str, Any]:
+        if body.bevestiging != "CANARY-BATCH VRIJGEVEN":
+            raise HTTPException(409, "Typ ter bevestiging exact: CANARY-BATCH VRIJGEVEN")
+        database = _database(request)
+        report = _canary_report(database, library_id)
+        if report["status"] == "vrijgegeven":
+            return report
+        if not report["kan_vrijgeven"]:
+            raise HTTPException(
+                409,
+                "Vrijgave vereist minstens één voltooide job en geen actieve job "
+                "in deze bibliotheek",
+            )
+        database.execute(
+            "UPDATE library SET canary_status='vrijgegeven' WHERE id=? AND canary_status='actief'",
+            (library_id,),
+        )
+        database.execute(
+            "UPDATE job SET fout=NULL WHERE bestand_id IN "
+            "(SELECT id FROM bestand WHERE library_id=?) "
+            "AND status='wacht' AND fout LIKE '%canary-batch%'",
+            (library_id,),
+        )
+        return _canary_report(database, library_id)
+
     async def start_scan(library_id: int, request: Request, dry_run: bool) -> dict[str, Any]:
-        _get_row(_database(request), "library", library_id)
+        library = _get_row(_database(request), "library", library_id)
+        if not int(library["actief"]):
+            raise HTTPException(409, "Deze bibliotheek is niet actief")
         task = asyncio.create_task(_scan_background(_database(request), library_id, dry_run))
         return {
-            "taak_id": _task_id(request, task),
+            "taak_id": _task_id(
+                request,
+                task,
+                f"library-{library_id}-scan-{uuid.uuid4()}",
+            ),
             "library_id": library_id,
             "droogloop": dry_run,
         }
@@ -474,19 +1117,33 @@ def create_api_router() -> APIRouter:
             "UPDATE profiel SET naam=?,inst=? WHERE id=?",
             (name, json.dumps(values, ensure_ascii=False), profile_id),
         )
+        if body.instellingen is not None:
+            affected = [
+                int(item["id"])
+                for item in database.fetch_all(
+                    "SELECT id FROM library WHERE profiel_id=?", (profile_id,)
+                )
+            ]
+            revoke_ai_consent(
+                database,
+                library_ids=affected,
+                reason="AI-toestemming ingetrokken door gewijzigde profielinstellingen",
+            )
         return {"id": profile_id, "naam": name, "instellingen": values}
 
     @router.post("/profielen/{profile_id}/proefdraai", status_code=status.HTTP_202_ACCEPTED)
     async def trial(profile_id: int, body: TrialRequest, request: Request) -> dict[str, Any]:
         database = _database(request)
         _get_row(database, "profiel", profile_id)
-        file_row = database.fetch_one("SELECT id,pad FROM bestand WHERE id=?", (body.bestand_id,))
+        file_row = database.fetch_one(
+            "SELECT id,pad,library_id FROM bestand WHERE id=?", (body.bestand_id,)
+        )
         if file_row is None:
             raise HTTPException(404, "Bestand bestaat niet in de catalogus")
         feature = database.fetch_one("SELECT ingeschakeld FROM functie WHERE sleutel='proefdraai'")
         if feature is None or not int(feature["ingeschakeld"]):
             raise HTTPException(409, "Schakel de optionele functie proefdraai eerst in")
-        identifier = str(uuid.uuid4())
+        identifier = f"library-{int(file_row['library_id'])}-trial-{uuid.uuid4()}"
         task = asyncio.create_task(
             run_profile_trial(
                 database,
@@ -633,7 +1290,7 @@ def create_api_router() -> APIRouter:
             decision_id = int(row["id"])
             database.execute(
                 "UPDATE besluit SET status='goedgekeurd',door_mens=1,"
-                "hardlink_bevestigd=? WHERE id=?",
+                "hardlink_bevestigd=?,goedkeuringsbron='mens' WHERE id=?",
                 (
                     int(int(row["nlink"]) > 1 and body.hardlinks_bevestigd),
                     decision_id,
@@ -719,7 +1376,7 @@ def create_api_router() -> APIRouter:
         payload.herstel_hdr_na = bool(body.encoder == "av1_qsv" and probe.get("is_hdr10"))
         changed = database.execute(
             "UPDATE besluit SET actie=?,baan=?,encoder=?,reden=?,payload=?,door_mens=1,"
-            "hardlink_bevestigd=? "
+            "hardlink_bevestigd=?,goedkeuringsbron='mens' "
             "WHERE id=? AND status='nieuw'",
             (
                 payload.actie,
@@ -815,10 +1472,34 @@ def create_api_router() -> APIRouter:
                 409,
                 "Deze job faalde drie keer identiek; wijzig eerst bron, profiel of oorzaak",
             )
+        other = database.fetch_one(
+            "SELECT id,status FROM job WHERE bestand_id=? AND id<>? "
+            "AND status IN ('wacht','bezig','verifieren','klaar') "
+            "ORDER BY CASE status WHEN 'klaar' THEN 0 ELSE 1 END,id LIMIT 1",
+            (int(row["bestand_id"]), job_id),
+        )
+        if other is not None:
+            raise HTTPException(
+                409,
+                f"Job {int(other['id'])} bewaakt dit bestand al met status "
+                f"{str(other['status'])}; een dubbele encode is geblokkeerd",
+            )
+        planner_tasks = getattr(request.app.state.planner, "tasks", {})
+        if job_id in planner_tasks and not planner_tasks[job_id].done():
+            raise HTTPException(409, "Deze job heeft nog een actieve achtergrondtaak")
+        if media_process_alive(
+            int(row["proces_pid"]) if row["proces_pid"] is not None else None
+        ):
+            raise HTTPException(409, "Deze job heeft nog een actief mediaproces")
+        try:
+            remove_job_temporary_output(_settings(request), job_id)
+        except QueueRecoveryError as exc:
+            raise HTTPException(409, str(exc)) from exc
         database.execute(
             """
             UPDATE job SET status='wacht',fout=NULL,foutsoort=NULL,afbreken_gevraagd=0,
-                           percent=0,proces_pid=NULL,worker_id=NULL,klaar_op=NULL WHERE id=?
+                           percent=0,proces_pid=NULL,worker_id=NULL,klaar_op=NULL,
+                           cache_reservering=0 WHERE id=?
             """,
             (job_id,),
         )
@@ -951,7 +1632,7 @@ def create_api_router() -> APIRouter:
         row = _database(request).fetch_one(
             """
             SELECT id,server_naam,tijdzone,log_niveau,cpu_max_percent,cpu_max_temperatuur,
-                   cache_waarschuwing_gb,cache_pauze_gb,hardlink_modus,
+                   max_gelijktijdige_encodes,cache_waarschuwing_gb,cache_pauze_gb,hardlink_modus,
                    meld_browser_fouten,meld_browser_batches,pauzeer_cpu_bij_kijken,
                    jellyfin_url,radarr_url,sonarr_url
             FROM instelling WHERE id=1
@@ -1088,7 +1769,382 @@ def create_api_router() -> APIRouter:
             database.execute(
                 f"UPDATE instelling SET {assignments} WHERE id=1", tuple(values.values())
             )
+        if "tijdzone" in values:
+            _scheduler(request).initialize_schedule()
         return await get_settings(request)
+
+    @router.get("/ai-controller")
+    async def get_ai_controller(request: Request) -> dict[str, Any]:
+        database = _database(request)
+        row = database.fetch_one(
+            "SELECT ingeschakeld,configuratie,laatste_fout,gewijzigd_op "
+            "FROM functie WHERE sleutel='ai_controller'"
+        )
+        if row is None:
+            raise HTTPException(500, "AI-controllerconfiguratie ontbreekt")
+        configuration = _json_object(str(row["configuratie"]))
+        month = datetime.now(UTC).strftime("%Y-%m")
+        usage = database.fetch_one(
+            """
+            SELECT COALESCE(SUM(input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(kosten_microdollar),0) AS kosten_microdollar,
+                   COUNT(*) AS analyses
+            FROM ai_analyse WHERE substr(gemaakt_op,1,7)=?
+            """,
+            (month,),
+        )
+        return {
+            "ingeschakeld": bool(row["ingeschakeld"]),
+            "modus": str(configuration.get("modus", "schaduw")),
+            "provider": "openai",
+            "model": str(configuration.get("model", "gpt-5.6-luna")),
+            "reasoning": str(configuration.get("reasoning", "medium")),
+            "maandbudget_usd": float(configuration.get("maandbudget_usd", 10)),
+            "hdr10_vrijgegeven": bool(configuration.get("hdr10_vrijgegeven", False)),
+            "api_sleutel_ingesteld": SecretStore(
+                database, _settings(request)
+            ).configured(AI_SECRET_KEY),
+            "laatste_fout": row["laatste_fout"],
+            "gewijzigd_op": row["gewijzigd_op"],
+            "verbruik": {
+                "maand": month,
+                "input_tokens": int(usage["input_tokens"] if usage else 0),
+                "output_tokens": int(usage["output_tokens"] if usage else 0),
+                "kosten_usd": round(
+                    int(usage["kosten_microdollar"] if usage else 0) / 1_000_000, 6
+                ),
+                "analyses": int(usage["analyses"] if usage else 0),
+            },
+            "hdr10_poort": _hdr_autonomy_readiness(database),
+            "bevoegdheden": [
+                "deterministisch veilig overslaan",
+                "waarschuwingvrije SDR-hercodering en -opschoning",
+                "maximaal één automatische herstelpoging per mislukte job",
+            ],
+            "altijd_handmatig": [
+                "opruimen, hardlinks, HDR10+, Dolby Vision en canary-vrijgave",
+                "encoderwissels en iedere fout die na de eerste herstelpoging terugkomt",
+                "verificatie-, metadata-, ACL/xattr-, mount- en herstelconflicten",
+            ],
+        }
+
+    @router.patch("/ai-controller")
+    async def update_ai_controller(
+        body: AiConfigPatch, request: Request
+    ) -> dict[str, Any]:
+        database = _database(request)
+        row = database.fetch_one(
+            "SELECT ingeschakeld,configuratie FROM functie WHERE sleutel='ai_controller'"
+        )
+        if row is None:
+            raise HTTPException(500, "AI-controllerconfiguratie ontbreekt")
+        if body.ingeschakeld and body.modus == "actief":
+            if body.bevestiging != AI_ACTIVE_CONFIRMATION:
+                raise HTTPException(409, f"Typ ter bevestiging exact: {AI_ACTIVE_CONFIRMATION}")
+            if not body.api_sleutel and not SecretStore(
+                database, _settings(request)
+            ).configured(AI_SECRET_KEY):
+                raise HTTPException(422, "Stel eerst de OpenAI API-sleutel in")
+        readiness = _hdr_autonomy_readiness(database)
+        if body.hdr10_vrijgegeven:
+            if body.hdr10_bevestiging != HDR10_CONFIRMATION:
+                raise HTTPException(409, f"Typ ter bevestiging exact: {HDR10_CONFIRMATION}")
+            if not readiness["gereed"]:
+                raise HTTPException(
+                    409,
+                    "HDR10 blijft geblokkeerd tot CPU en QSV exact groene metadata-encodes hebben",
+                )
+        if body.verwijder_sleutel and body.api_sleutel:
+            raise HTTPException(422, "Kies sleutel instellen of verwijderen, niet beide")
+        if body.verwijder_sleutel and body.ingeschakeld:
+            raise HTTPException(422, "Schakel AI eerst uit voordat je de API-sleutel verwijdert")
+        store = SecretStore(database, _settings(request))
+        try:
+            if body.api_sleutel:
+                store.set(AI_SECRET_KEY, body.api_sleutel)
+            elif body.verwijder_sleutel:
+                store.delete(AI_SECRET_KEY)
+        except SecretError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        old_configuration = _json_object(str(row["configuratie"]))
+        configuration = {
+            **old_configuration,
+            "modus": body.modus,
+            "provider": "openai",
+            "model": "gpt-5.6-luna",
+            "reasoning": "medium",
+            "maandbudget_usd": body.maandbudget_usd,
+            "hdr10_vrijgegeven": body.hdr10_vrijgegeven,
+            "prompt_versie": str(old_configuration.get("prompt_versie", "1")),
+        }
+        now = datetime.now(UTC).isoformat()
+        database.execute(
+            """
+            UPDATE functie
+            SET ingeschakeld=?,configuratie=?,laatste_fout=NULL,gewijzigd_op=?
+            WHERE sleutel='ai_controller'
+            """,
+            (
+                int(body.ingeschakeld),
+                json.dumps(configuration, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+        database.execute(
+            "INSERT INTO auditlog(soort,onderwerp,oud,nieuw,tijd) "
+            "VALUES ('ai','controller',?,?,?)",
+            (
+                json.dumps(
+                    {
+                        "ingeschakeld": bool(row["ingeschakeld"]),
+                        "modus": old_configuration.get("modus"),
+                        "hdr10_vrijgegeven": old_configuration.get(
+                            "hdr10_vrijgegeven", False
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "ingeschakeld": body.ingeschakeld,
+                        "modus": body.modus,
+                        "hdr10_vrijgegeven": body.hdr10_vrijgegeven,
+                        "tv_test_bewust_overgeslagen": body.hdr10_vrijgegeven,
+                    },
+                    ensure_ascii=False,
+                ),
+                now,
+            ),
+        )
+        return await get_ai_controller(request)
+
+    @router.post("/ai-controller/analyseer", status_code=status.HTTP_202_ACCEPTED)
+    async def analyze_ai_now(request: Request) -> dict[str, int]:
+        return await _ai_controller(request).tick()
+
+    @router.get("/ai-controller/analyses")
+    async def ai_analyses(
+        request: Request,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, Any]]:
+        rows = _database(request).fetch_all(
+            """
+            SELECT a.id,a.soort,a.library_id,a.besluit_id,a.job_id,a.provider,a.model,
+                   a.modus,a.classificatie,a.voorgestelde_actie,a.policy_uitkomst,
+                   a.uitgevoerd,a.voorstel,a.input_tokens,a.output_tokens,
+                   a.kosten_microdollar,a.fout,a.gemaakt_op,l.naam AS library_naam
+            FROM ai_analyse a
+            LEFT JOIN library l ON l.id=a.library_id
+            ORDER BY a.id DESC LIMIT ?
+            """,
+            (limit,),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            proposal = _json_object(str(item.get("voorstel") or "{}"))
+            item["redencodes"] = proposal.get("redencodes", [])
+            item["bewijsvelden"] = proposal.get("bewijsvelden", [])
+            item["vertrouwen"] = proposal.get("vertrouwen")
+            item["kosten_usd"] = round(int(item["kosten_microdollar"]) / 1_000_000, 6)
+            # De ruwe JSON bevat geen extra informatie meer en hoeft niet naar de browser.
+            item.pop("voorstel", None)
+            result.append(item)
+        return result
+
+    @router.get("/ai-controller/statistieken")
+    async def ai_statistics(
+        request: Request,
+        dagen: int = Query(default=30, ge=7, le=365),
+    ) -> dict[str, Any]:
+        database = _database(request)
+        setting = database.fetch_one("SELECT tijdzone FROM instelling WHERE id=1")
+        timezone_name = str(
+            setting["tijdzone"] if setting is not None else "Europe/Amsterdam"
+        )
+        try:
+            zone = ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            zone = ZoneInfo("UTC")
+            timezone_name = "UTC"
+
+        now = datetime.now(UTC)
+        local_today = now.astimezone(zone).date()
+        first_day = local_today - timedelta(days=dagen - 1)
+        first_moment = datetime.combine(first_day, time.min, tzinfo=zone).astimezone(UTC)
+        rows = database.fetch_all(
+            """
+            SELECT classificatie,uitgevoerd,input_tokens,output_tokens,
+                   kosten_microdollar,fout,gemaakt_op
+            FROM ai_analyse
+            WHERE gemaakt_op>=?
+            ORDER BY gemaakt_op
+            """,
+            (first_moment.isoformat(),),
+        )
+        per_day: dict[str, dict[str, Any]] = {}
+        for offset in range(dagen):
+            day = first_day + timedelta(days=offset)
+            per_day[day.isoformat()] = {
+                "dag": day.isoformat(),
+                "analyses": 0,
+                "beslissingen": 0,
+                "overeenkomstig": 0,
+                "tijdelijk": 0,
+                "mens_nodig": 0,
+                "geblokkeerd": 0,
+                "provider_fouten": 0,
+                "uitgevoerd": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "kosten_microdollar": 0,
+                "kosten_usd": 0.0,
+            }
+        classifications = {"overeenkomstig", "tijdelijk", "mens_nodig", "geblokkeerd"}
+        for row in rows:
+            try:
+                made_at = datetime.fromisoformat(str(row["gemaakt_op"]).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if made_at.tzinfo is None:
+                made_at = made_at.replace(tzinfo=UTC)
+            bucket = per_day.get(made_at.astimezone(zone).date().isoformat())
+            if bucket is None:
+                continue
+            bucket["analyses"] += 1
+            classification = str(row["classificatie"] or "")
+            if classification in classifications:
+                bucket["beslissingen"] += 1
+                bucket[classification] += 1
+            if row["fout"]:
+                bucket["provider_fouten"] += 1
+            bucket["uitgevoerd"] += int(row["uitgevoerd"] or 0)
+            bucket["input_tokens"] += int(row["input_tokens"] or 0)
+            bucket["output_tokens"] += int(row["output_tokens"] or 0)
+            bucket["kosten_microdollar"] += int(row["kosten_microdollar"] or 0)
+
+        totals = {
+            key: sum(int(day[key]) for day in per_day.values())
+            for key in (
+                "analyses",
+                "beslissingen",
+                "overeenkomstig",
+                "tijdelijk",
+                "mens_nodig",
+                "geblokkeerd",
+                "provider_fouten",
+                "uitgevoerd",
+                "input_tokens",
+                "output_tokens",
+                "kosten_microdollar",
+            )
+        }
+        for day_bucket in per_day.values():
+            day_bucket["kosten_usd"] = round(
+                day_bucket["kosten_microdollar"] / 1_000_000, 6
+            )
+        return {
+            "dagen": dagen,
+            "tijdzone": timezone_name,
+            "totaal": {
+                **totals,
+                "kosten_usd": round(totals["kosten_microdollar"] / 1_000_000, 6),
+            },
+            "per_dag": list(per_day.values()),
+        }
+
+    @router.get("/lan-toegang")
+    async def get_lan_access(request: Request) -> dict[str, Any]:
+        row = _database(request).fetch_one(
+            "SELECT ingeschakeld,configuratie,laatste_fout,gewijzigd_op "
+            "FROM functie WHERE sleutel='externe_toegang'"
+        )
+        if row is None:
+            raise HTTPException(500, "LAN-toegangsconfiguratie ontbreekt")
+        configuration = _json_object(str(row["configuratie"]))
+        username = configuration.get("gebruikersnaam")
+        return {
+            "ingeschakeld": bool(row["ingeschakeld"]),
+            "gebruikersnaam": username if isinstance(username, str) else "transcode",
+            "wachtwoord_ingesteld": isinstance(configuration.get("wachtwoord_hash"), str),
+            "adressen": lan_urls(),
+            "laatste_fout": row["laatste_fout"],
+            "gewijzigd_op": row["gewijzigd_op"],
+            "uitleg": (
+                "Alleen apparaten op een privénetwerk worden toegelaten. "
+                "FastAPI en poort 8000 blijven uitsluitend lokaal bereikbaar."
+            ),
+        }
+
+    @router.get("/lan-toegang/autoriseer", include_in_schema=False)
+    async def authorize_lan_access(request: Request) -> Response:
+        row = _database(request).fetch_one(
+            "SELECT ingeschakeld,configuratie FROM functie WHERE sleutel='externe_toegang'"
+        )
+        if row is None or not bool(row["ingeschakeld"]):
+            raise HTTPException(403, "LAN-toegang staat uit")
+        configuration = _json_object(str(row["configuratie"]))
+        if not authorization_matches(configuration, request.headers.get("authorization")):
+            raise HTTPException(
+                401,
+                "Ongeldige LAN-aanmelding",
+                headers={"WWW-Authenticate": 'Basic realm="AV1 Pipeline", charset="UTF-8"'},
+            )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @router.patch("/lan-toegang")
+    async def update_lan_access(body: LanAccessPatch, request: Request) -> dict[str, Any]:
+        database = _database(request)
+        row = database.fetch_one(
+            "SELECT ingeschakeld,configuratie FROM functie WHERE sleutel='externe_toegang'"
+        )
+        if row is None:
+            raise HTTPException(500, "LAN-toegangsconfiguratie ontbreekt")
+        old_configuration = _json_object(str(row["configuratie"]))
+        username_value = body.gebruikersnaam or old_configuration.get("gebruikersnaam")
+        try:
+            username = validate_username(
+                username_value if isinstance(username_value, str) else "transcode"
+            )
+            password_hash = old_configuration.get("wachtwoord_hash")
+            if body.wachtwoord is not None:
+                password_hash = hash_password(body.wachtwoord)
+        except LanConfigError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if body.ingeschakeld:
+            if body.bevestiging != LAN_CONFIRMATION:
+                raise HTTPException(409, f"Typ ter bevestiging exact: {LAN_CONFIRMATION}")
+            if not isinstance(password_hash, str):
+                raise HTTPException(422, "Stel eerst een LAN-wachtwoord in")
+        new_configuration: dict[str, Any] = {"gebruikersnaam": username}
+        if isinstance(password_hash, str):
+            new_configuration["wachtwoord_hash"] = password_hash
+        changed = datetime.now(UTC).isoformat()
+        database.execute(
+            "UPDATE functie SET ingeschakeld=?,configuratie=?,laatste_fout=NULL,gewijzigd_op=? "
+            "WHERE sleutel='externe_toegang'",
+            (int(body.ingeschakeld), json.dumps(new_configuration), changed),
+        )
+        database.execute(
+            "INSERT INTO auditlog(soort,onderwerp,oud,nieuw,tijd) "
+            "VALUES ('functie','externe_toegang',?,?,?)",
+            (
+                json.dumps(
+                    {
+                        "ingeschakeld": bool(row["ingeschakeld"]),
+                        "gebruikersnaam": old_configuration.get("gebruikersnaam"),
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {"ingeschakeld": body.ingeschakeld, "gebruikersnaam": username},
+                    ensure_ascii=False,
+                ),
+                changed,
+            ),
+        )
+        return await get_lan_access(request)
 
     @router.get("/functies")
     async def features(request: Request) -> list[dict[str, Any]]:
@@ -1107,11 +2163,20 @@ def create_api_router() -> APIRouter:
             "dv_experimenteel": "Sta AV1 met Dolby Vision toe; compatibiliteit blijft beperkt.",
             "automatische_backups": "Maak periodieke gecontroleerde SQLite-back-ups.",
             "canary_limiet": "Beperk een nieuw profiel eerst tot enkele jobs.",
+            "ai_controller": (
+                "Begrensde AI-controle in schaduw- of actieve modus; lokale policy beslist."
+            ),
         }
         result = []
         for row in _database(request).fetch_all("SELECT * FROM functie ORDER BY sleutel"):
             item = _as_bool_fields(dict(row))
-            item["configuratie"] = _json_object(str(item["configuratie"]))
+            configuration = _json_object(str(item["configuratie"]))
+            if item["sleutel"] == "externe_toegang":
+                configuration.pop("wachtwoord_hash", None)
+                configuration["wachtwoord_ingesteld"] = bool(
+                    _json_object(str(row["configuratie"])).get("wachtwoord_hash")
+                )
+            item["configuratie"] = configuration
             item["uitleg"] = descriptions.get(str(item["sleutel"]), "Optionele functie")
             result.append(item)
         return result
@@ -1122,8 +2187,11 @@ def create_api_router() -> APIRouter:
         row = database.fetch_one("SELECT * FROM functie WHERE sleutel=?", (key,))
         if row is None:
             raise HTTPException(404, "Onbekende functie")
+        if key == "externe_toegang":
+            raise HTTPException(409, "Gebruik de afgeschermde LAN-toegangsinstelling")
+        if key == "ai_controller":
+            raise HTTPException(409, "Gebruik de afgeschermde AI-controllerinstelling")
         confirmations = {
-            "externe_toegang": (True, "LAN-TOEGANG INSCHAKELEN"),
             "hardlink_verbreken": (True, "HARDLINKS VERBREKEN"),
             "dv_experimenteel": (True, "EXPERIMENTEEL DOLBY VISION"),
             "canary_limiet": (False, "CANARY-LIMIET UITZETTEN"),
@@ -1156,6 +2224,52 @@ def create_api_router() -> APIRouter:
             "ingeschakeld": body.ingeschakeld,
             "configuratie": body.configuratie,
         }
+
+    @router.get("/systeem/wachtrijherstel")
+    async def queue_recovery_status(request: Request) -> dict[str, Any]:
+        tasks = getattr(request.app.state.planner, "tasks", {})
+        active_task_ids = {
+            int(job_id) for job_id, task in tasks.items() if not task.done()
+        }
+        return queue_recovery_report(
+            _database(request), _settings(request), active_task_ids
+        )
+
+    @router.post("/systeem/wachtrijherstel")
+    async def run_queue_recovery(
+        body: QueueRecoveryRequest, request: Request
+    ) -> dict[str, Any]:
+        if body.bevestiging != "WACHTRIJ VEILIG HERSTELLEN":
+            raise HTTPException(409, "Typ ter bevestiging exact: WACHTRIJ VEILIG HERSTELLEN")
+        database = _database(request)
+        tasks = getattr(request.app.state.planner, "tasks", {})
+        active_task_ids = {
+            int(job_id) for job_id, task in tasks.items() if not task.done()
+        }
+        previous = database.fetch_all(
+            "SELECT baan,gepauzeerd,pauze_reden FROM worker_config ORDER BY baan"
+        )
+        database.execute(
+            "UPDATE worker_config SET gepauzeerd=1,pauze_reden='tijdelijk: wachtrijherstel'"
+        )
+        try:
+            result = recover_queue(
+                database, _settings(request), active_task_ids
+            )
+        except QueueRecoveryError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        finally:
+            for row in previous:
+                database.execute(
+                    "UPDATE worker_config SET gepauzeerd=?,pauze_reden=? WHERE baan=?",
+                    (int(row["gepauzeerd"]), row["pauze_reden"], str(row["baan"])),
+                )
+        database.execute(
+            "INSERT INTO auditlog(soort,onderwerp,oud,nieuw,tijd) "
+            "VALUES ('wachtrijherstel','tijdelijke-output',NULL,?,?)",
+            (json.dumps(result, ensure_ascii=False), datetime.now(UTC).isoformat()),
+        )
+        return result
 
     @router.post("/systeem/qsv-test")
     async def run_qsv_test(request: Request) -> dict[str, Any]:
@@ -1205,6 +2319,10 @@ def create_api_router() -> APIRouter:
     @router.get("/kwaliteit/verificaties")
     async def verifications(request: Request) -> list[dict[str, Any]]:
         return verification_overview(_database(request))
+
+    @router.get("/kwaliteit/dolby-vision")
+    async def dolby_vision_status(request: Request) -> dict[str, Any]:
+        return dolby_vision_overview(_database(request))
 
     @router.get("/kwaliteit/jobs/{job_id}/frame/{kind}")
     async def quality_frame(

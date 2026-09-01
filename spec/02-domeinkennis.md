@@ -44,6 +44,12 @@ Je zoekt naar een ffmpeg-vlag die er niet is. Voor SVT-AV1 gaat het via
 
 Let op de volgorde: **G, B, R, WP, L**.
 
+`MaxCLL=0` en `MaxFALL=0` betekenen dat er geen gemeten content-lightwaarden
+zijn vastgelegd. `libsvtav1` accepteert `content-light=0,0`, maar laat deze lege
+record in het AV1-resultaat weg. De verifier behandelt daarom uitsluitend
+`"0,0"` en een ontbrekende record als semantisch gelijk; iedere niet-nul
+afwijking en iedere mastering-displayafwijking blijft een harde fout.
+
 ## 3. `av1_qsv` kan HDR-metadata helemaal niet meedragen
 
 Controleer het zelf:

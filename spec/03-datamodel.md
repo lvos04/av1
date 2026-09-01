@@ -7,10 +7,18 @@ SQLite met WAL. Eén schrijver (de backend), meerdere lezers.
 CREATE TABLE library (
     id            INTEGER PRIMARY KEY,
     naam          TEXT NOT NULL,              -- "Anime", "Films"
-    pad           TEXT NOT NULL UNIQUE,       -- "/library/anime"
+    pad           TEXT NOT NULL UNIQUE,       -- lokaal servicepad
+    bron_type     TEXT NOT NULL DEFAULT 'lokaal', -- lokaal of smb
+    bron_uri      TEXT,                       -- nooit credentials in de URI
+    bron_controle TEXT,                       -- JSON eerste-gebruiktest
+    bron_gecontroleerd_op TEXT,
     profiel_id    INTEGER NOT NULL REFERENCES profiel(id),
     scan_interval INTEGER DEFAULT 86400,      -- seconden, 0 = alleen handmatig
+    scan_tijd     TEXT NOT NULL DEFAULT '03:00',
+    volgende_scan TIMESTAMP,
     laatste_scan  TIMESTAMP,
+    laatste_scan_status TEXT NOT NULL DEFAULT 'nooit',
+    laatste_scan_fout TEXT,
     actief        BOOLEAN DEFAULT 1
 );
 
@@ -69,8 +77,15 @@ CREATE TABLE bestand (
     grootte      INTEGER NOT NULL,
     mtime        REAL NOT NULL,
     nlink        INTEGER DEFAULT 1,           -- >1 = hardlink, zie regel 9
+    device       INTEGER,
+    inode        INTEGER,
+    aanwezig     BOOLEAN NOT NULL DEFAULT 1,  -- tombstone in plaats van DELETE
     categorie    TEXT NOT NULL,               -- ok | extra | kort | geen_video
     probe        TEXT,                        -- JSON van probe.probe()
+    eerste_gezien TIMESTAMP,
+    stabiel_vanaf TIMESTAMP,
+    scan_status  TEXT NOT NULL DEFAULT 'gereed', -- gereed|wacht_op_stabiliteit|verdwenen
+    profiel_fingerprint TEXT,                 -- profiel plus besliscode
     gescand_op   TIMESTAMP NOT NULL
 );
 CREATE INDEX idx_bestand_library ON bestand(library_id);
@@ -88,6 +103,8 @@ CREATE TABLE besluit (
     payload     TEXT NOT NULL,                -- JSON van Besluit
     status      TEXT NOT NULL DEFAULT 'nieuw',-- nieuw|goedgekeurd|afgewezen|ingepland
     door_mens   BOOLEAN DEFAULT 0,            -- handmatig overruled?
+    goedkeuringsbron TEXT,                    -- mens | ai_policy
+    ai_analyse_id INTEGER REFERENCES ai_analyse(id),
     gemaakt_op  TIMESTAMP NOT NULL
 );
 CREATE INDEX idx_besluit_status ON besluit(status);
@@ -116,10 +133,27 @@ CREATE TABLE job (
     eta_seconden   INTEGER,
     fout           TEXT,
     pogingen       INTEGER NOT NULL DEFAULT 0,
+    automatische_retry_pogingen INTEGER NOT NULL DEFAULT 0,
     gestart_op     TIMESTAMP,
     klaar_op       TIMESTAMP
 );
 CREATE INDEX idx_job_status ON job(status, baan, prioriteit DESC);
+
+-- Iedere retry behoudt de oorspronkelijke oorzaak; een nieuwe poging wist
+-- nooit de oude fout- of tijdlijninformatie.
+CREATE TABLE job_poging (
+    id                 INTEGER PRIMARY KEY,
+    job_id             INTEGER NOT NULL REFERENCES job(id) ON DELETE CASCADE,
+    poging             INTEGER NOT NULL,
+    status             TEXT NOT NULL,
+    fout               TEXT,
+    foutsoort          TEXT,
+    fout_handtekening  TEXT,
+    gestart_op         TIMESTAMP,
+    klaar_op           TIMESTAMP,
+    ai_analyse_id      INTEGER REFERENCES ai_analyse(id),
+    UNIQUE(job_id, poging)
+);
 
 -- ── Verificatie: is de metadata heel gebleven ────────────────────────
 CREATE TABLE verificatie (
@@ -168,6 +202,47 @@ CREATE TABLE auditlog (
     oud         TEXT,
     nieuw       TEXT,
     tijd        TIMESTAMP NOT NULL
+);
+
+-- Eén rij per gegroepeerde besluit- of fouthandtekening. Er wordt geen pad,
+-- promptinhoud of geheim opgeslagen; invoer_hash is alleen een lokale audit.
+CREATE TABLE ai_analyse (
+    id                   INTEGER PRIMARY KEY,
+    soort                TEXT NOT NULL,       -- besluitgroep | foutgroep
+    fingerprint          TEXT NOT NULL,
+    library_id           INTEGER REFERENCES library(id),
+    besluit_id           INTEGER REFERENCES besluit(id),
+    job_id               INTEGER REFERENCES job(id),
+    provider             TEXT NOT NULL,
+    model                TEXT NOT NULL,
+    prompt_versie        TEXT NOT NULL,
+    modus                TEXT NOT NULL,       -- schaduw | actief
+    invoer_hash           TEXT NOT NULL,
+    classificatie        TEXT,
+    voorgestelde_actie   TEXT,
+    voorstel             TEXT,                -- getypeerd AiProposal-JSON
+    policy_uitkomst      TEXT,
+    uitgevoerd           BOOLEAN NOT NULL DEFAULT 0,
+    input_tokens         INTEGER NOT NULL DEFAULT 0,
+    output_tokens        INTEGER NOT NULL DEFAULT 0,
+    kosten_microdollar   INTEGER NOT NULL DEFAULT 0,
+    fout                 TEXT,
+    gemaakt_op           TIMESTAMP NOT NULL
+);
+
+CREATE TABLE scan_run (
+    id          INTEGER PRIMARY KEY,
+    library_id  INTEGER NOT NULL REFERENCES library(id),
+    status      TEXT NOT NULL,
+    cursor      TEXT,
+    gevonden    INTEGER NOT NULL DEFAULT 0,
+    nieuw       INTEGER NOT NULL DEFAULT 0,
+    gewijzigd  INTEGER NOT NULL DEFAULT 0,
+    verdwenen  INTEGER NOT NULL DEFAULT 0,
+    uitgesteld INTEGER NOT NULL DEFAULT 0,
+    fout        TEXT,
+    gestart_op  TIMESTAMP NOT NULL,
+    klaar_op    TIMESTAMP
 );
 
 CREATE TABLE backup_status (

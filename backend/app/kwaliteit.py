@@ -273,3 +273,97 @@ def verification_overview(database: Database) -> list[dict[str, Any]]:
             """
         )
     ]
+
+
+def dolby_vision_overview(database: Database, limit: int = 500) -> dict[str, Any]:
+    """Toon DV-detectie ook voordat er een encoderesultaat bestaat.
+
+    De verificatietabel ontstaat pas na een encodepoging. Alleen die tabel tonen
+    wekte daardoor ten onrechte de indruk dat wachtende of veilig overgeslagen
+    DV-bronnen niet waren herkend.
+    """
+    summary = database.fetch_one(
+        """
+        SELECT COUNT(*) AS totaal,
+               SUM(CASE WHEN CAST(json_extract(probe,'$.dv_profile') AS INTEGER)=5
+                        THEN 1 ELSE 0 END) AS profiel_5,
+               SUM(CASE WHEN CAST(json_extract(probe,'$.dv_profile') AS INTEGER)=7
+                        THEN 1 ELSE 0 END) AS profiel_7,
+               SUM(CASE WHEN CAST(json_extract(probe,'$.dv_profile') AS INTEGER)=8
+                        THEN 1 ELSE 0 END) AS profiel_8,
+               SUM(CASE WHEN CAST(json_extract(probe,'$.dv_profile') AS INTEGER)
+                                  NOT IN (5,7,8)
+                        THEN 1 ELSE 0 END) AS overige_profielen
+        FROM bestand
+        WHERE COALESCE(CAST(json_extract(probe,'$.dv_profile') AS INTEGER),0)>0
+        """
+    )
+    rows = database.fetch_all(
+        """
+        WITH laatste_besluit AS (
+            SELECT b.*,
+                   ROW_NUMBER() OVER (PARTITION BY b.bestand_id ORDER BY b.id DESC) AS rang
+            FROM besluit b
+        ), relevante_job AS (
+            SELECT j.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY j.bestand_id
+                       ORDER BY CASE
+                           WHEN j.status IN ('wacht','gereserveerd','bezig','verifieren') THEN 0
+                           WHEN j.status='klaar' THEN 1
+                           ELSE 2
+                       END, j.id DESC
+                   ) AS rang
+            FROM job j
+        )
+        SELECT f.id AS bestand_id,f.pad,
+               CAST(json_extract(f.probe,'$.dv_profile') AS INTEGER) AS dv_profile,
+               COALESCE(CAST(json_extract(f.probe,'$.dv_compat') AS INTEGER),0) AS dv_compat,
+               COALESCE(CAST(json_extract(f.probe,'$.is_hdr10') AS INTEGER),0) AS is_hdr10,
+               b.id AS besluit_id,b.actie AS besluit_actie,b.status AS besluit_status,b.reden,
+               j.id AS job_id,j.status AS job_status,
+               v.dv_bron,v.dv_resultaat,v.geslaagd AS verificatie_geslaagd,
+               v.toelichting AS verificatie_toelichting
+        FROM bestand f
+        LEFT JOIN laatste_besluit b ON b.bestand_id=f.id AND b.rang=1
+        LEFT JOIN relevante_job j ON j.bestand_id=f.id AND j.rang=1
+        LEFT JOIN verificatie v ON v.job_id=j.id
+        WHERE COALESCE(CAST(json_extract(f.probe,'$.dv_profile') AS INTEGER),0)>0
+        ORDER BY f.pad
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        job_status = str(item["job_status"] or "")
+        if item["verificatie_geslaagd"] is not None:
+            item["controle_status"] = (
+                "geverifieerd" if bool(item["verificatie_geslaagd"]) else "afgekeurd"
+            )
+        elif job_status in {"wacht", "gereserveerd", "bezig", "verifieren"}:
+            item["controle_status"] = "wacht_op_resultaat"
+        elif item["besluit_actie"] == "overslaan":
+            item["controle_status"] = "veilig_overgeslagen"
+        else:
+            item["controle_status"] = "niet_ingepland"
+        items.append(item)
+
+    counts = dict(summary) if summary is not None else {}
+    total = int(counts.get("totaal") or 0)
+    return {
+        "totaal": total,
+        "profielen": {
+            "5": int(counts.get("profiel_5") or 0),
+            "7": int(counts.get("profiel_7") or 0),
+            "8": int(counts.get("profiel_8") or 0),
+            "overig": int(counts.get("overige_profielen") or 0),
+        },
+        "items": items,
+        "afgekapt": total > len(items),
+        "uitleg": (
+            "Bronprofiel komt uit de catalogusscan; resultaatprofiel verschijnt pas na "
+            "een volledige encode en verplichte verificatie."
+        ),
+    }

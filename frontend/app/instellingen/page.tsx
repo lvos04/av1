@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
+import AiPage from "@/app/ai/page";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -14,6 +15,7 @@ interface Settings {
   log_niveau: "debug" | "info" | "warning" | "error";
   cpu_max_percent: number;
   cpu_max_temperatuur: number;
+  max_gelijktijdige_encodes: number;
   cache_waarschuwing_gb: number;
   cache_pauze_gb: number;
   hardlink_modus: "overslaan" | "verbreek_na_bevestiging";
@@ -84,14 +86,75 @@ interface StorageState {
   uitleg: string;
 }
 
+interface LanAccessState {
+  ingeschakeld: boolean;
+  gebruikersnaam: string;
+  wachtwoord_ingesteld: boolean;
+  adressen: string[];
+  laatste_fout: string | null;
+  gewijzigd_op: string;
+  uitleg: string;
+}
+
+interface QueueRecoveryState {
+  actieve_jobs: number[];
+  weesjobs: number[];
+  tijdelijke_jobs: number[];
+  onbekende_paden: string[];
+  onveilige_paden: string[];
+  onveilige_workerinstellingen: Array<{ baan: string; aantal: number; aanbevolen: number }>;
+  geheugen_totaal_bytes: number;
+  geheugen_beschikbaar_bytes: number;
+  kan_herstellen: boolean;
+  uitleg: string;
+}
+
+interface QueueRecoveryResult {
+  herstelde_jobs: number[];
+  opgeruimde_jobs: number[];
+  verwijderde_mappen: number;
+  herstelde_workerbanen: string[];
+  onbekende_paden_overgeslagen: string[];
+  uitleg: string;
+}
+
+interface AiControllerState {
+  ingeschakeld: boolean;
+  modus: "schaduw" | "actief";
+  provider: "openai";
+  model: string;
+  reasoning: string;
+  maandbudget_usd: number;
+  hdr10_vrijgegeven: boolean;
+  api_sleutel_ingesteld: boolean;
+  laatste_fout: string | null;
+  gewijzigd_op: string;
+  verbruik: {
+    maand: string;
+    input_tokens: number;
+    output_tokens: number;
+    kosten_usd: number;
+    analyses: number;
+  };
+  hdr10_poort: {
+    gereed: boolean;
+    cpu: { geslaagd: number; afwijkingen: number };
+    qsv: { geslaagd: number; afwijkingen: number };
+    tv_test_vereist: boolean;
+    uitleg: string;
+  };
+  bevoegdheden: string[];
+  altijd_handmatig: string[];
+}
+
 const confirmations: Record<string, { enabled: boolean; text: string }> = {
-  externe_toegang: { enabled: true, text: "LAN-TOEGANG INSCHAKELEN" },
   hardlink_verbreken: { enabled: true, text: "HARDLINKS VERBREKEN" },
   dv_experimenteel: { enabled: true, text: "EXPERIMENTEEL DOLBY VISION" },
   canary_limiet: { enabled: false, text: "CANARY-LIMIET UITZETTEN" },
 };
 
 export default function SettingsPage() {
+  const [showAi, setShowAi] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [features, setFeatures] = useState<Feature[]>([]);
   const [integrations, setIntegrations] = useState<Integration[]>([]);
@@ -99,18 +162,24 @@ export default function SettingsPage() {
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [recovery, setRecovery] = useState<Recovery[]>([]);
   const [storage, setStorage] = useState<StorageState | null>(null);
+  const [lanAccess, setLanAccess] = useState<LanAccessState | null>(null);
+  const [queueRecovery, setQueueRecovery] = useState<QueueRecoveryState | null>(null);
+  const [aiController, setAiController] = useState<AiControllerState | null>(null);
   const [storageMode, setStorageMode] = useState<StorageState["modus"]>("systeemschijf");
   const [message, setMessage] = useState("");
   const storageForm = useRef<HTMLFormElement>(null);
 
   const load = useCallback(async () => {
-    const [loadedSettings, loadedFeatures, loadedIntegrations, loadedBackups, loadedRecovery, loadedStorage] = await Promise.all([
+    const [loadedSettings, loadedFeatures, loadedIntegrations, loadedBackups, loadedRecovery, loadedStorage, loadedLanAccess, loadedQueueRecovery, loadedAiController] = await Promise.all([
       api<Settings>("/instellingen"),
       api<Feature[]>("/functies"),
       api<Integration[]>("/integraties"),
       api<Backup[]>("/backups"),
       api<Recovery[]>("/herstel"),
       api<StorageState>("/opslag"),
+      api<LanAccessState>("/lan-toegang"),
+      api<QueueRecoveryState>("/systeem/wachtrijherstel"),
+      api<AiControllerState>("/ai-controller"),
     ]);
     setSettings(loadedSettings);
     setFeatures(loadedFeatures);
@@ -119,9 +188,22 @@ export default function SettingsPage() {
     setRecovery(loadedRecovery);
     setStorage(loadedStorage);
     setStorageMode(loadedStorage.modus);
+    setLanAccess(loadedLanAccess);
+    setQueueRecovery(loadedQueueRecovery);
+    setAiController(loadedAiController);
   }, []);
 
   useEffect(() => { load().catch((error: unknown) => setMessage(String(error))); }, [load]);
+  useEffect(() => {
+    const update = () => setShowAi(window.location.search === "?tab=ai");
+    update();
+    window.addEventListener("popstate", update);
+    window.addEventListener("pipeline:location", update);
+    return () => {
+      window.removeEventListener("popstate", update);
+      window.removeEventListener("pipeline:location", update);
+    };
+  }, []);
 
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -133,6 +215,7 @@ export default function SettingsPage() {
         log_niveau: String(data.get("log_niveau")),
         cpu_max_percent: Number(data.get("cpu_max_percent")),
         cpu_max_temperatuur: Number(data.get("cpu_max_temperatuur")),
+        max_gelijktijdige_encodes: Number(data.get("max_gelijktijdige_encodes")),
         cache_waarschuwing_gb: Number(data.get("cache_waarschuwing_gb")),
         cache_pauze_gb: Number(data.get("cache_pauze_gb")),
         hardlink_modus: String(data.get("hardlink_modus")),
@@ -143,6 +226,32 @@ export default function SettingsPage() {
       setSettings(result);
       setMessage("Instellingen server-side gevalideerd en opgeslagen.");
     } catch (error) { setMessage(String(error)); }
+  }
+
+  async function saveAiController(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    try {
+      const result = await mutation<AiControllerState>("/ai-controller", "PATCH", {
+        ingeschakeld: data.get("ingeschakeld") === "on",
+        modus: String(data.get("modus")),
+        maandbudget_usd: Number(data.get("maandbudget_usd")),
+        api_sleutel: String(data.get("api_sleutel") ?? "") || undefined,
+        hdr10_vrijgegeven: data.get("hdr10_vrijgegeven") === "on",
+        bevestiging: String(data.get("bevestiging") ?? "") || undefined,
+        hdr10_bevestiging: String(data.get("hdr10_bevestiging") ?? "") || undefined,
+      });
+      setAiController(result);
+      form.reset();
+      setMessage(
+        result.modus === "actief" && result.ingeschakeld
+          ? "Begrensde AI-controller actief; alleen policy-toegestane acties lopen door."
+          : "AI-controllerconfiguratie opgeslagen in schaduwmodus of uitgeschakeld.",
+      );
+    } catch (error) {
+      setMessage(String(error));
+    }
   }
 
   function storagePayload(form: HTMLFormElement) {
@@ -201,6 +310,33 @@ export default function SettingsPage() {
     } catch (error) { setMessage(String(error)); }
   }
 
+  async function saveLanAccess(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    try {
+      const result = await mutation<LanAccessState>("/lan-toegang", "PATCH", {
+        ingeschakeld: true,
+        gebruikersnaam: String(data.get("gebruikersnaam") ?? ""),
+        wachtwoord: String(data.get("wachtwoord") ?? "") || undefined,
+        bevestiging: String(data.get("bevestiging") ?? ""),
+      });
+      setLanAccess(result);
+      form.reset();
+      setMessage("Beveiligde LAN-toegang staat aan. Meld op een andere computer aan met dit account.");
+    } catch (error) { setMessage(String(error)); }
+  }
+
+  async function disableLanAccess() {
+    try {
+      const result = await mutation<LanAccessState>("/lan-toegang", "PATCH", {
+        ingeschakeld: false,
+      });
+      setLanAccess(result);
+      setMessage("LAN-toegang staat uit; lokale bediening op deze machine blijft werken.");
+    } catch (error) { setMessage(String(error)); }
+  }
+
   async function saveIntegration(event: FormEvent<HTMLFormElement>, item: Integration) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -238,6 +374,24 @@ export default function SettingsPage() {
     setMessage("Back-up met SHA-256-manifest gemaakt.");
   }
 
+  async function restoreQueue() {
+    const confirmation = window.prompt("Typ exact: WACHTRIJ VEILIG HERSTELLEN");
+    if (confirmation === null) return;
+    try {
+      const result = await mutation<QueueRecoveryResult>("/systeem/wachtrijherstel", "POST", {
+        bevestiging: confirmation,
+      });
+      await load();
+      setMessage(
+        `${result.herstelde_jobs.length} vastgelopen job(s) hersteld en ` +
+        `${result.verwijderde_mappen} tijdelijke map(pen) veilig verwijderd. ` +
+        `${result.herstelde_workerbanen.length} workerinstelling(en) begrensd. ` +
+        "Bronbestanden en voltooide jobs zijn niet gewijzigd.",
+      );
+    } catch (error) { setMessage(String(error)); }
+  }
+
+  if (showAi) return <AiPage />;
   if (!settings) return <Card className="empty-state">Instellingen worden geladen…</Card>;
   return <div className="page-stack">
     {message ? <Card className="notice" role="status">{message}</Card> : null}
@@ -253,6 +407,7 @@ export default function SettingsPage() {
       <Field label="Logniveau"><select name="log_niveau" defaultValue={settings.log_niveau}><option>debug</option><option>info</option><option>warning</option><option>error</option></select></Field>
       <Field label="CPU-limiet (%)"><input name="cpu_max_percent" type="number" min="10" max="100" defaultValue={settings.cpu_max_percent} /></Field>
       <Field label="Temperatuurgrens (°C)"><input name="cpu_max_temperatuur" type="number" min="40" max="110" defaultValue={settings.cpu_max_temperatuur} /></Field>
+      <Field label="Gelijktijdige encodes"><input name="max_gelijktijdige_encodes" type="number" min="1" defaultValue={settings.max_gelijktijdige_encodes} /><small>1 is aanbevolen met het huidige RAM; na een geheugenupgrade kun je dit verhogen.</small></Field>
       <Field label="Cachewaarschuwing (GB)"><input name="cache_waarschuwing_gb" type="number" min="2" defaultValue={settings.cache_waarschuwing_gb} /></Field>
       <Field label="Cachepauze (GB)"><input name="cache_pauze_gb" type="number" min={storage?.modus === "systeemschijf" ? storage.systeemschijf_reserve_gb : 1} defaultValue={settings.cache_pauze_gb} /></Field>
       <Field label="Hardlinkbeleid"><select name="hardlink_modus" defaultValue={settings.hardlink_modus}><option value="overslaan">altijd overslaan</option><option value="verbreek_na_bevestiging">verbreek na bevestiging</option></select></Field>
@@ -261,9 +416,27 @@ export default function SettingsPage() {
       <label className="toggle-row"><input name="meld_browser_batches" type="checkbox" defaultChecked={settings.meld_browser_batches} /><span>Browsermelding bij afgeronde batch</span></label>
     </div><Button type="button" variant="secondary" onClick={requestNotifications}>Vraag browserrechten</Button></Card></form>
 
-    <Card className="settings-card"><h2>Onderdelen</h2><p className="muted">Uitschakelen stopt alleen nieuw werk en verwijdert niets. Kernveiligheid staat niet in deze lijst.</p><div className="feature-list">{features.map((feature) => <div className="feature-row" key={feature.sleutel}><div><strong>{feature.sleutel.replaceAll("_", " ")}</strong><p>{feature.uitleg}</p>{feature.laatste_fout ? <small className="danger">{feature.laatste_fout}</small> : null}</div><Button variant={feature.ingeschakeld ? "secondary" : "default"} aria-pressed={feature.ingeschakeld} onClick={() => toggleFeature(feature)}>{feature.ingeschakeld ? "Aan" : "Uit"}</Button></div>)}</div></Card>
+    {aiController ? <form key={aiController.gewijzigd_op} onSubmit={saveAiController}><Card className="settings-card"><div className="worker-header"><div><h2>AI-controller</h2><span className="muted">OpenAI {aiController.model} · reasoning {aiController.reasoning} · geen tools · store:false · paden alleen als HMAC.</span></div><Badge tone={aiController.ingeschakeld ? aiController.modus === "actief" ? "green" : "amber" : "neutral"}>{aiController.ingeschakeld ? aiController.modus : "uit"}</Badge></div><div className="settings-grid">
+      <label className="toggle-row"><input name="ingeschakeld" type="checkbox" defaultChecked={aiController.ingeschakeld} /><span>AI-analyses uitvoeren</span></label>
+      <Field label="Modus"><select name="modus" defaultValue={aiController.modus}><option value="schaduw">Schaduw — alleen voorstellen</option><option value="actief">Actief — uitsluitend binnen policy</option></select></Field>
+      <Field label="Maandbudget (USD)"><input name="maandbudget_usd" type="number" min="0.10" max="100" step="0.10" defaultValue={aiController.maandbudget_usd} /></Field>
+      <Field label={aiController.api_sleutel_ingesteld ? "Nieuwe API-sleutel (leeg = behouden)" : "OpenAI API-sleutel"}><input name="api_sleutel" type="password" autoComplete="new-password" /></Field>
+      <Field label="Actieve-modusbevestiging"><input name="bevestiging" placeholder="AI-BEPERKTE AUTONOMIE INSCHAKELEN" autoComplete="off" /></Field>
+      <label className="toggle-row"><input name="hdr10_vrijgegeven" type="checkbox" defaultChecked={aiController.hdr10_vrijgegeven} disabled={!aiController.hdr10_poort.gereed} /><span>HDR10-autonomie afzonderlijk vrijgeven</span></label>
+      <Field label="HDR10-bevestiging"><input name="hdr10_bevestiging" placeholder="HDR10-METADATA-AUTONOMIE" autoComplete="off" disabled={!aiController.hdr10_poort.gereed} /></Field>
+    </div><p className="muted">Typ voor actieve modus exact <span className="mono">AI-BEPERKTE AUTONOMIE INSCHAKELEN</span>. Kosten deze maand: ${aiController.verbruik.kosten_usd.toFixed(4)} van ${aiController.maandbudget_usd.toFixed(2)} · {aiController.verbruik.analyses} analyses · {aiController.verbruik.input_tokens.toLocaleString("nl-NL")} inputtokens.</p><p className="muted">Automatisch toegestaan: {aiController.bevoegdheden.join("; ")}. Altijd handmatig/geblokkeerd: {aiController.altijd_handmatig.join("; ")}.</p><p className={aiController.hdr10_poort.gereed ? "muted" : "danger"}>HDR10-poort: {aiController.hdr10_poort.gereed ? "groen" : "geblokkeerd"} · CPU {aiController.hdr10_poort.cpu.geslaagd} goed/{aiController.hdr10_poort.cpu.afwijkingen} afwijkingen · QSV {aiController.hdr10_poort.qsv.geslaagd} goed/{aiController.hdr10_poort.qsv.afwijkingen} afwijkingen. {aiController.hdr10_poort.uitleg}</p>{aiController.laatste_fout ? <p className="danger">Laatste providerfout: {aiController.laatste_fout}</p> : null}<div className="decision-actions"><Button type="submit">Versleuteld opslaan</Button><Button type="button" variant="secondary" disabled={!aiController.ingeschakeld} onClick={async () => { try { const result = await mutation<Record<string, number>>("/ai-controller/analyseer", "POST"); await load(); setMessage(`AI-controle klaar: ${JSON.stringify(result)}`); } catch (error) { setMessage(String(error)); } }}>Nu in achtergrond controleren</Button></div><p className="muted">Prijsgrens in de controller: maximaal 8.000 input- en 800 outputtokens per gegroepeerde handtekening. Providerstoring, ongeldig JSON of budgetoverschrijding voert niets uit.</p></Card></form> : null}
+
+    {lanAccess ? <form onSubmit={saveLanAccess}><Card className="settings-card"><div className="worker-header"><div><h2>Toegang vanaf andere computers</h2><span className="muted">De webinterface gebruikt poort 3000. De backend en poort 8000 blijven afgeschermd op deze machine.</span></div><Badge tone={lanAccess.ingeschakeld ? "green" : "neutral"}>{lanAccess.ingeschakeld ? "LAN actief" : "alleen lokaal"}</Badge></div><div className="settings-grid">
+      <Field label="Gebruikersnaam"><input name="gebruikersnaam" defaultValue={lanAccess.gebruikersnaam} minLength={3} maxLength={64} pattern="[A-Za-z0-9._-]+" autoComplete="username" required /></Field>
+      <Field label={lanAccess.wachtwoord_ingesteld ? "Nieuw wachtwoord (leeg = behouden)" : "Wachtwoord"}><input name="wachtwoord" type="password" minLength={12} maxLength={128} autoComplete="new-password" required={!lanAccess.wachtwoord_ingesteld} /></Field>
+      <Field label="Bevestiging"><input name="bevestiging" placeholder="LAN-TOEGANG INSCHAKELEN" autoComplete="off" required /></Field>
+    </div><p className="muted">Typ bij Bevestiging exact <span className="mono">LAN-TOEGANG INSCHAKELEN</span>. Het wachtwoord wordt direct geheugenhard gehasht en komt niet terug in de browser of logs.</p><div className="decision-actions"><Button type="submit">{lanAccess.ingeschakeld ? "Account veilig bijwerken" : "LAN-toegang inschakelen"}</Button>{lanAccess.ingeschakeld ? <Button type="button" variant="danger" onClick={disableLanAccess}>LAN-toegang uitschakelen</Button> : null}</div>{lanAccess.adressen.length ? <p className="mono muted">Open daarna op een andere computer:<br />{lanAccess.adressen.join("\n")}</p> : <p className="muted">Geen actief IPv4-netwerkadres gevonden.</p>}<p className="muted">Alleen privé-IP-adressen worden geaccepteerd. Na vijf foute aanmeldingen volgt tijdelijk een blokkade. Gebruik voor toegang vanaf internet eerst een VPN; stuur poort 3000 niet door in je router.</p>{lanAccess.laatste_fout ? <p className="danger">{lanAccess.laatste_fout}</p> : null}</Card></form> : null}
+
+    <Card className="settings-card"><h2>Onderdelen</h2><p className="muted">Uitschakelen stopt alleen nieuw werk en verwijdert niets. Kernveiligheid staat niet in deze lijst.</p><div className="feature-list">{features.filter((feature) => !["externe_toegang", "ai_controller"].includes(feature.sleutel)).map((feature) => <div className="feature-row" key={feature.sleutel}><div><strong>{feature.sleutel.replaceAll("_", " ")}</strong><p>{feature.uitleg}</p>{feature.laatste_fout ? <small className="danger">{feature.laatste_fout}</small> : null}</div><Button variant={feature.ingeschakeld ? "secondary" : "default"} aria-pressed={feature.ingeschakeld} onClick={() => toggleFeature(feature)}>{feature.ingeschakeld ? "Aan" : "Uit"}</Button></div>)}</div></Card>
 
     <Card className="settings-card"><div className="worker-header"><div><h2>Hardwarediagnose</h2><span className="muted">QSV-test en GPU-meting veranderen of resetten geen kernel-driver.</span></div><div className="decision-actions"><Button variant="secondary" onClick={async () => { try { setMessage(JSON.stringify(await mutation("/systeem/qsv-test", "POST"))); } catch (error) { setMessage(String(error)); } }}>Test QSV-verbinding</Button><Button variant="secondary" onClick={async () => setMessage(JSON.stringify(await mutation("/systeem/gpu-herstart", "POST")))}>Herstart GPU-monitor</Button><Button variant="ghost" onClick={async () => setDiagnosis(await api<Diagnosis>("/systeem/diagnose"))}>Ververs diagnose</Button></div></div>{diagnosis ? <pre>{JSON.stringify(diagnosis, null, 2)}</pre> : null}</Card>
+
+    {queueRecovery ? <Card className="settings-card"><div className="worker-header"><div><h2>Wachtrij herstellen</h2><span className="muted">Algemene veilige reset voor vastgelopen jobstatussen, te zware workerinstellingen en achtergebleven tijdelijke cache.</span></div><Badge tone={queueRecovery.actieve_jobs.length ? "blue" : queueRecovery.kan_herstellen ? "amber" : "green"}>{queueRecovery.actieve_jobs.length ? "job actief" : queueRecovery.kan_herstellen ? "herstel beschikbaar" : "geen herstel nodig"}</Badge></div><p>{queueRecovery.uitleg}</p><p className="muted">Werkelijk actief: {queueRecovery.actieve_jobs.length} · vastgelopen: {queueRecovery.weesjobs.length} · tijdelijke jobmappen: {queueRecovery.tijdelijke_jobs.length} · {bytes(queueRecovery.geheugen_beschikbaar_bytes)} van {bytes(queueRecovery.geheugen_totaal_bytes)} RAM beschikbaar</p>{queueRecovery.onveilige_workerinstellingen.map((item) => <p className="danger" key={item.baan}>{item.baan.toUpperCase()} gebruikt {item.aantal} workers; voor deze host is {item.aanbevolen} veilig om geheugentekort te voorkomen.</p>)}{queueRecovery.onbekende_paden.length ? <p className="danger">{queueRecovery.onbekende_paden.length} onbekende tijdelijke paden worden bewust niet verwijderd.</p> : null}{queueRecovery.onveilige_paden.length ? <p className="danger">Herstel geblokkeerd: {queueRecovery.onveilige_paden[0]}</p> : null}<div className="decision-actions"><Button variant="secondary" onClick={async () => { try { setQueueRecovery(await api<QueueRecoveryState>("/systeem/wachtrijherstel")); setMessage("Wachtrijstatus opnieuw gecontroleerd."); } catch (error) { setMessage(String(error)); } }}>Controleer opnieuw</Button><Button variant="danger" disabled={!queueRecovery.kan_herstellen || queueRecovery.actieve_jobs.length > 0} onClick={restoreQueue}>Herstel vastgelopen wachtrij</Button></div><p className="muted">De knop weigert te werken zolang een echte encoder of achtergrondtaak actief is. Media in de bibliotheek en geslaagde resultaten worden nooit verwijderd.</p></Card> : null}
 
     <Card className="settings-card"><h2>Jellyfin, Radarr en Sonarr</h2><div className="integration-grid">{integrations.map((item) => <form key={item.naam} className="integration-card" onSubmit={(event) => saveIntegration(event, item)}><div className="worker-header"><strong>{item.naam}</strong><Badge tone={item.sleutel_ingesteld ? "green" : "neutral"}>{item.sleutel_ingesteld ? "sleutel ingesteld" : "geen sleutel"}</Badge></div><Field label="URL"><input name="url" type="url" defaultValue={item.url ?? ""} placeholder={`http://${item.naam}:7878`} /></Field><Field label="Nieuwe API-sleutel"><input name="api_sleutel" type="password" autoComplete="new-password" /></Field><div className="decision-actions"><Button type="submit">Versleuteld opslaan</Button><Button type="button" variant="secondary" onClick={() => testIntegration(item)}>Test opgeslagen verbinding</Button></div></form>)}</div></Card>
 

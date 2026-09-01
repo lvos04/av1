@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 
 from app import __version__
+from app.ai_controller import AiController, reconcile_safety_fingerprint
 from app.api import create_api_router
 from app.config import ConfigError, Settings, settings
 from app.db import Database
@@ -21,6 +22,7 @@ from app.media.beslissen import STANDAARD
 from app.onderhoud import maintenance_loop
 from app.opslag import storage_validation_error
 from app.planner import Planner
+from app.scanscheduler import LibraryScanScheduler
 from app.systeem import GpuMonitor
 from app.vervanging import recover_replacements
 
@@ -64,6 +66,8 @@ def create_app(
                 (f"opslag niet gereed: {storage_error}",),
             )
         _ensure_default_profile(database)
+        reconcile_safety_fingerprint(database)
+        application.state.scan_scheduler.initialize_schedule()
         recovery = recover_replacements(database, app_settings)
         if recovery:
             LOGGER.warning("%d vervangtransacties beoordeeld bij opstart", len(recovery))
@@ -73,15 +77,29 @@ def create_app(
         if gpu_enabled is not None and int(gpu_enabled["ingeschakeld"]):
             await application.state.gpu_monitor.start()
         planner_task: asyncio.Task[None] | None = None
+        scan_scheduler_task: asyncio.Task[None] | None = None
+        ai_controller_task: asyncio.Task[None] | None = None
         integration_task = asyncio.create_task(application.state.integration_monitor.run_forever())
         maintenance_task = asyncio.create_task(maintenance_loop(database, app_settings))
         if start_planner:
             planner_task = asyncio.create_task(application.state.planner.run_forever())
+            scan_scheduler_task = asyncio.create_task(
+                application.state.scan_scheduler.run_forever()
+            )
+            ai_controller_task = asyncio.create_task(
+                application.state.ai_controller.run_forever()
+            )
         yield
         application.state.planner.stopping = True
+        application.state.scan_scheduler.stopping = True
+        application.state.ai_controller.stopping = True
         application.state.integration_monitor.stopping = True
         if planner_task is not None:
             await planner_task
+        if scan_scheduler_task is not None:
+            await scan_scheduler_task
+        if ai_controller_task is not None:
+            await ai_controller_task
         integration_task.cancel()
         with suppress(asyncio.CancelledError):
             await integration_task
@@ -106,6 +124,8 @@ def create_app(
     application.state.database = database
     application.state.gpu_monitor = GpuMonitor()
     application.state.planner = Planner(database, app_settings)
+    application.state.scan_scheduler = LibraryScanScheduler(database)
+    application.state.ai_controller = AiController(database, app_settings)
     application.state.integration_monitor = IntegrationMonitor(database, app_settings)
     application.state.background_tasks = {}
     application.state.storage_error = None

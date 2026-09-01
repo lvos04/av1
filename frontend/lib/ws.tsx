@@ -17,7 +17,17 @@ interface LiveState {
   tick: TickMessage | null;
   verbonden: boolean;
   events: EventMessage[];
-  metrics: Array<{ tijd: string; cpu: number; gpu: number | null }>;
+  metrics: Array<{
+    tijd: string;
+    cpu: number;
+    gpuVideo: number | null;
+    gpuRender: number | null;
+    gpuPower: number | null;
+    packagePower: number | null;
+    platformPower: number | null;
+    memoryPercent: number;
+    memoryUsedBytes: number;
+  }>;
   volg: (jobId: number) => void;
   stopVolgen: (jobId: number) => void;
 }
@@ -27,7 +37,7 @@ const LiveContext = createContext<LiveState | null>(null);
 function websocketUrl(): string {
   if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.hostname}:8000/ws`;
+  return `${protocol}//${window.location.host}/ws`;
 }
 
 function mergeWorkers(previous: LiveWorker[], current: LiveWorker[]): LiveWorker[] {
@@ -102,7 +112,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
             workers: mergeWorkers(old?.workers ?? [], value.workers),
           }));
           setMetrics((old) => [
-            ...old.slice(-359),
+            ...old.slice(-3599),
             {
               tijd: new Date().toLocaleTimeString("nl-NL", {
                 hour: "2-digit",
@@ -110,9 +120,15 @@ export function LiveProvider({ children }: { children: ReactNode }) {
                 second: "2-digit",
               }),
               cpu: value.systeem.cpu_percent,
-              gpu: value.systeem.gpu.beschikbaar
-                ? value.systeem.gpu.video_percent
-                : null,
+              gpuVideo: value.systeem.gpu.beschikbaar
+                ? value.systeem.gpu.video_percent : null,
+              gpuRender: value.systeem.gpu.beschikbaar
+                ? value.systeem.gpu.render_percent : null,
+              gpuPower: value.systeem.gpu.power_w,
+              packagePower: value.systeem.gpu.package_power_w,
+              platformPower: value.systeem.gpu.platform_power_w,
+              memoryPercent: value.systeem.geheugen?.percent ?? 0,
+              memoryUsedBytes: value.systeem.geheugen?.gebruikt_bytes ?? 0,
             },
           ]);
         } else {

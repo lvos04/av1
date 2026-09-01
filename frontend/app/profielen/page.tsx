@@ -7,6 +7,11 @@ import { Card } from "@/components/ui/card";
 import { api, mutation } from "@/lib/api";
 import type { Profile } from "@/types";
 
+interface Feature {
+  sleutel: string;
+  ingeschakeld: boolean;
+}
+
 const help: Record<string, string> = {
   drempel_2160: "Alleen 4K-video boven deze kbps-drempel wordt hercodeerd.",
   drempel_1080: "Alleen 1080p-video boven deze kbps-drempel wordt hercodeerd.",
@@ -29,8 +34,20 @@ const help: Record<string, string> = {
 
 export default function ProfilesPage() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [saved, setSaved] = useState("");
-  const load = useCallback(() => api<Profile[]>("/profielen").then(setProfiles), []);
+  const [message, setMessage] = useState("");
+  const [messageIsError, setMessageIsError] = useState(false);
+  const [dvEnabled, setDvEnabled] = useState(false);
+  const load = useCallback(async () => {
+    const [loadedProfiles, features] = await Promise.all([
+      api<Profile[]>("/profielen"),
+      api<Feature[]>("/functies"),
+    ]);
+    setProfiles(loadedProfiles);
+    setDvEnabled(
+      features.find((feature) => feature.sleutel === "dv_experimenteel")?.ingeschakeld
+        === true,
+    );
+  }, []);
   useEffect(() => { void load(); }, [load]);
 
   function updateLocal(profileId: number, key: string, raw: string | boolean) {
@@ -45,9 +62,20 @@ export default function ProfilesPage() {
   }
 
   async function save(profile: Profile) {
-    await mutation(`/profielen/${profile.id}`, "PATCH", { naam: profile.naam, instellingen: profile.instellingen });
-    setSaved(`Profiel ‘${profile.naam}’ opgeslagen. Nieuwe scans gebruiken deze waarden; bestaande besluiten veranderen niet stil.`);
+    setMessage("");
+    try {
+      const updated = await mutation<Profile>(`/profielen/${profile.id}`, "PATCH", {
+        naam: profile.naam,
+        instellingen: profile.instellingen,
+      });
+      setProfiles((old) => old.map((item) => item.id === updated.id ? updated : item));
+      setMessageIsError(false);
+      setMessage(`Profiel ‘${profile.naam}’ opgeslagen. Nieuwe scans gebruiken deze waarden; bestaande besluiten veranderen niet stil.`);
+    } catch (error) {
+      setMessageIsError(true);
+      setMessage(`Opslaan mislukt: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
-  return <div className="page-stack">{saved ? <Card className="notice" role="status">{saved}</Card> : null}{profiles.map((profile) => <Card className="profile-card" key={profile.id}><div className="worker-header"><h2>{profile.naam}</h2><Button onClick={() => save(profile)}>Profiel opslaan</Button></div><div className="profile-grid">{Object.entries(profile.instellingen).map(([key, value]) => <label className="profile-field" key={key}><span><strong>{key}</strong><small>{help[key] ?? "Profielinstelling voor de beslisboom."}</small></span>{typeof value === "boolean" ? <input type="checkbox" checked={value} onChange={(event) => updateLocal(profile.id, key, event.target.checked)} /> : key === "dv_modus" ? <select value={String(value)} onChange={(event) => updateLocal(profile.id, key, event.target.value)}><option value="skip">skip — veilig</option><option value="av1">av1 — experimenteel</option></select> : <input value={Array.isArray(value) ? value.join(", ") : String(value)} onChange={(event) => updateLocal(profile.id, key, event.target.value)} />}</label>)}</div><div className="profile-footer"><p><strong>Proefdraaien</strong><br/><span className="muted">Schakel de optionele functie in en kies op Kwaliteit één catalogusbestand. Er wordt nooit automatisch een heel bestand gestart.</span></p><a className="button button-secondary" href="/kwaliteit">Naar Kwaliteit</a></div></Card>)}</div>;
+  return <div className="page-stack">{message ? <Card className="notice" role={messageIsError ? "alert" : "status"}><span className={messageIsError ? "danger" : undefined}>{message}</span></Card> : null}<Card className="notice"><strong>Dolby Vision: {dvEnabled ? "experimentele functie aan" : "experimentele functie uit"}</strong><span className="muted">DV-profiel 5 blijft altijd overgeslagen. AV1 met DV-profiel 10 is metadata-technisch getest, maar afspelen op Jellyfin, Apple TV en televisies is niet algemeen gedocumenteerd.</span>{!dvEnabled ? <a className="button button-secondary" href="/instellingen">Schakel DV eerst expliciet in bij Instellingen</a> : null}</Card>{profiles.map((profile) => <Card className="profile-card" key={profile.id}><div className="worker-header"><h2>{profile.naam}</h2><Button onClick={() => save(profile)}>Profiel opslaan</Button></div><div className="profile-grid">{Object.entries(profile.instellingen).map(([key, value]) => <label className="profile-field" key={key}><span><strong>{key}</strong><small>{help[key] ?? "Profielinstelling voor de beslisboom."}</small>{key === "dv_modus" && value === "av1" && !dvEnabled ? <small className="danger">Opslaan blijft geblokkeerd totdat dv experimenteel bij Instellingen expliciet is ingeschakeld.</small> : null}</span>{typeof value === "boolean" ? <input type="checkbox" checked={value} onChange={(event) => updateLocal(profile.id, key, event.target.checked)} /> : key === "dv_modus" ? <select value={String(value)} onChange={(event) => updateLocal(profile.id, key, event.target.value)}><option value="skip">skip — veilig</option><option value="av1">av1 — experimenteel</option></select> : <input value={Array.isArray(value) ? value.join(", ") : String(value)} onChange={(event) => updateLocal(profile.id, key, event.target.value)} />}</label>)}</div><div className="profile-footer"><p><strong>Proefdraaien</strong><br/><span className="muted">Schakel de optionele functie in en kies op Kwaliteit één catalogusbestand. Er wordt nooit automatisch een heel bestand gestart.</span></p><a className="button button-secondary" href="/kwaliteit">Naar Kwaliteit</a></div></Card>)}</div>;
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 from collections.abc import Callable
@@ -13,6 +14,7 @@ from typing import Any
 from app.bestandsmetadata import FileMetadata, MetadataError, apply_metadata
 from app.config import Settings
 from app.db import Database
+from app.media.probe import probe
 
 
 class ReplacementError(RuntimeError):
@@ -132,23 +134,54 @@ def _source_matches(row: Any, source: Path) -> bool:
 
 def _finish_recovered_job(database: Database, job_id: int, source: Path) -> None:
     row = database.fetch_one(
-        "SELECT j.bron_grootte,f.library_id FROM job j "
+        "SELECT j.bron_grootte,j.pogingen,f.id AS bestand_id,f.library_id FROM job j "
         "JOIN bestand f ON f.id=j.bestand_id WHERE j.id=?",
         (job_id,),
     )
+    completed_at = datetime.now(UTC).isoformat()
+    source_stat = source.stat()
     database.execute(
         """
         UPDATE job SET status='klaar',resultaat_pad=?,resultaat_grootte=?,percent=100,
                        klaar_op=?,proces_pid=NULL,cache_reservering=0 WHERE id=?
         """,
-        (str(source), source.stat().st_size, datetime.now(UTC).isoformat(), job_id),
+        (str(source), source_stat.st_size, completed_at, job_id),
     )
+    result_probe = probe(str(source))
+    if row is not None and result_probe is not None:
+        database.execute(
+            """
+            UPDATE bestand
+            SET grootte=?,mtime=?,nlink=?,device=?,inode=?,probe=?,gescand_op=?,
+                aanwezig=1,stabiel_vanaf=?,scan_status='gereed'
+            WHERE id=?
+            """,
+            (
+                source_stat.st_size,
+                source_stat.st_mtime,
+                source_stat.st_nlink,
+                source_stat.st_dev,
+                source_stat.st_ino,
+                json.dumps(result_probe, ensure_ascii=False),
+                completed_at,
+                completed_at,
+                int(row["bestand_id"]),
+            ),
+        )
+    if row is not None:
+        database.execute(
+            """
+            UPDATE job_poging SET status='klaar',klaar_op=?
+            WHERE job_id=? AND poging=?
+            """,
+            (completed_at, job_id, int(row["pogingen"])),
+        )
     saving = database.fetch_one("SELECT id FROM besparing WHERE job_id=?", (job_id,))
     if row is not None and saving is None and row["bron_grootte"] is not None:
         database.execute(
             "INSERT INTO besparing(job_id,library_id,bytes_voor,bytes_na,dag) "
             "VALUES (?,?,?,?,date('now'))",
-            (job_id, int(row["library_id"]), int(row["bron_grootte"]), source.stat().st_size),
+            (job_id, int(row["library_id"]), int(row["bron_grootte"]), source_stat.st_size),
         )
 
 

@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from app.bestandsmetadata import MetadataError, capture_metadata
+from app.bronnen import SourceError, validate_registered_source
 from app.config import Settings
 from app.db import Database
 from app.integraties import refresh_after_replacement
@@ -31,6 +33,34 @@ class ExecutionError(RuntimeError):
 
 
 VerificationHook = Callable[[VerificationResult], VerificationResult]
+
+
+def _finish_attempt(
+    database: Database,
+    job_id: int,
+    status: str,
+    *,
+    error: str | None = None,
+    error_type: str | None = None,
+) -> None:
+    row = database.fetch_one("SELECT pogingen FROM job WHERE id=?", (job_id,))
+    if row is None or int(row["pogingen"]) < 1:
+        return
+    database.execute(
+        """
+        UPDATE job_poging
+        SET status=?,fout=COALESCE(?,fout),foutsoort=COALESCE(?,foutsoort),klaar_op=?
+        WHERE job_id=? AND poging=?
+        """,
+        (
+            status,
+            error,
+            error_type,
+            datetime.now(UTC).isoformat(),
+            job_id,
+            int(row["pogingen"]),
+        ),
+    )
 
 
 def _progress_number(value: str, suffix: str = "") -> float | None:
@@ -62,13 +92,35 @@ def create_job_from_decision(database: Database, decision_id: int) -> int:
     existing = database.fetch_one("SELECT id FROM job WHERE besluit_id=?", (decision_id,))
     if existing is not None:
         return int(existing["id"])
-    job_id = database.execute_insert(
-        """
-        INSERT INTO job(besluit_id,bestand_id,baan,status,prioriteit)
-        VALUES (?, ?, ?, 'wacht', 0)
-        """,
-        (decision_id, int(row["bestand_id"]), str(row["baan"] or "cpu")),
+    active_for_file = database.fetch_one(
+        "SELECT id FROM job WHERE bestand_id=? "
+        "AND status IN ('wacht','bezig','verifieren') ORDER BY id LIMIT 1",
+        (int(row["bestand_id"]),),
     )
+    if active_for_file is not None:
+        # De unieke index is de laatste racebeveiliging; deze expliciete route
+        # houdt herhaalde UI-goedkeuring idempotent en begrijpelijk.
+        database.execute(
+            "UPDATE besluit SET status='ingepland' WHERE id=?", (decision_id,)
+        )
+        return int(active_for_file["id"])
+    try:
+        job_id = database.execute_insert(
+            """
+            INSERT INTO job(besluit_id,bestand_id,baan,status,prioriteit)
+            VALUES (?, ?, ?, 'wacht', 0)
+            """,
+            (decision_id, int(row["bestand_id"]), str(row["baan"] or "cpu")),
+        )
+    except sqlite3.IntegrityError as exc:
+        active_for_file = database.fetch_one(
+            "SELECT id FROM job WHERE bestand_id=? "
+            "AND status IN ('wacht','bezig','verifieren') ORDER BY id LIMIT 1",
+            (int(row["bestand_id"]),),
+        )
+        if active_for_file is None:
+            raise ExecutionError("Job kon niet uniek worden ingepland") from exc
+        return int(active_for_file["id"])
     database.execute("UPDATE besluit SET status='ingepland' WHERE id=?", (decision_id,))
     return job_id
 
@@ -170,22 +222,35 @@ async def run_job(
         storage_validator = settings.validate_storage
     storage_validator()
     if not already_claimed:
+        started_at = datetime.now(UTC).isoformat()
         claimed = database.execute(
             """
             UPDATE job SET status='bezig',worker_id=?,gestart_op=?,pogingen=pogingen+1
             WHERE id=? AND status='wacht'
             """,
-            (worker_id, datetime.now(UTC).isoformat(), job_id),
+            (worker_id, started_at, job_id),
         )
         if claimed != 1:
             raise ExecutionError("Job kon niet atomisch worden geclaimd")
+        attempt = database.fetch_one("SELECT pogingen FROM job WHERE id=?", (job_id,))
+        if attempt is not None:
+            database.execute(
+                """
+                INSERT INTO job_poging(job_id,poging,status,gestart_op)
+                VALUES (?,?,'bezig',?)
+                ON CONFLICT(job_id,poging) DO UPDATE SET
+                    status='bezig',gestart_op=excluded.gestart_op,klaar_op=NULL
+                """,
+                (job_id, int(attempt["pogingen"]), started_at),
+            )
 
     row = database.fetch_one(
         """
         SELECT j.*,b.payload,b.actie,b.hardlink_bevestigd,
                p.id AS profiel_id,p.inst AS profiel_inst,
                f.pad,f.grootte,f.mtime,
-               f.nlink,f.library_id,l.pad AS library_pad,l.verwacht_device
+               f.nlink,f.library_id,l.pad AS library_pad,l.verwacht_device,
+               l.bron_type,l.bron_uri
         FROM job j
         JOIN besluit b ON b.id=j.besluit_id
         JOIN bestand f ON f.id=j.bestand_id
@@ -198,6 +263,22 @@ async def run_job(
     if row is None:
         raise ExecutionError(f"Job {job_id} bestaat niet")
     source = Path(str(row["pad"]))
+    try:
+        current_device = validate_registered_source(
+            Path(str(row["library_pad"])),
+            source_type=str(row["bron_type"]),
+            source_uri=str(row["bron_uri"]) if row["bron_uri"] else None,
+            expected_device=(
+                int(row["verwacht_device"]) if row["verwacht_device"] is not None else None
+            ),
+        )
+    except SourceError as exc:
+        raise ExecutionError(str(exc)) from exc
+    if str(row["bron_type"]) == "smb" and current_device != row["verwacht_device"]:
+        database.execute(
+            "UPDATE library SET verwacht_device=? WHERE id=?",
+            (current_device, int(row["library_id"])),
+        )
     cache_dir = settings.cache_root / str(job_id)
     work_dir = settings.work_root / str(job_id)
     log_dir = settings.config_root / "logs"
@@ -225,7 +306,7 @@ async def run_job(
                 or policy["hardlink_modus"] != "verbreek_na_bevestiging"
             ):
                 raise ExecutionError("hardlink is vóór uitvoering veilig gestopt")
-        if row["verwacht_device"] is not None and source_stat.st_dev != int(row["verwacht_device"]):
+        if source_stat.st_dev != current_device:
             raise ExecutionError("library staat niet meer op het verwachte device")
         metadata = capture_metadata(source)
         source_probe = probe(str(source))
@@ -236,6 +317,7 @@ async def run_job(
                 "UPDATE job SET status='overgeslagen',fout=?,klaar_op=? WHERE id=?",
                 ("HDR10+ wordt altijd overgeslagen", datetime.now(UTC).isoformat(), job_id),
             )
+            _finish_attempt(database, job_id, "overgeslagen")
             return False
         decision = Besluit.model_validate_json(str(row["payload"]))
         profile_raw: Any = json.loads(str(row["profiel_inst"]))
@@ -320,6 +402,7 @@ async def run_job(
                     """,
                     (datetime.now(UTC).isoformat(), job_id),
                 )
+                _finish_attempt(database, job_id, "afgebroken")
                 shutil.rmtree(cache_dir)
                 return False
             raise ExecutionError("encoderproces faalde")
@@ -375,6 +458,30 @@ async def run_job(
                 verification.reason,
             ),
         )
+        if (
+            not verification.passed
+            and decision.actie == "opschonen"
+            and verification.reason == "resultaat is groter dan de bron"
+        ):
+            # Opschonen is alleen zinvol bij echte ruimtewinst. Een groter
+            # resultaat is geen mediastoring: de bron blijft intact en de
+            # tijdelijke remux wordt zonder retry verwijderd.
+            database.execute(
+                """
+                UPDATE job SET status='overgeslagen',fout=?,foutsoort='GeenBesparing',
+                               resultaat_pad=NULL,resultaat_grootte=NULL,klaar_op=?,
+                               proces_pid=NULL
+                WHERE id=?
+                """,
+                (
+                    "opschonen veilig overgeslagen: geen besparing",
+                    datetime.now(UTC).isoformat(),
+                    job_id,
+                ),
+            )
+            _finish_attempt(database, job_id, "overgeslagen")
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            return False
         if not verification.passed:
             raise ExecutionError(f"verificatie mislukt: {verification.reason}")
 
@@ -406,13 +513,34 @@ async def run_job(
             )
 
         atomic_replace(database, job_id, source, result_path, metadata)
-        final_size = source.stat().st_size
+        final_stat = source.stat()
+        final_size = final_stat.st_size
+        completed_at = datetime.now(UTC).isoformat()
         database.execute(
             """
             UPDATE job SET status='klaar',resultaat_pad=?,resultaat_grootte=?,percent=100,
                            klaar_op=?,proces_pid=NULL WHERE id=?
             """,
-            (str(source), final_size, datetime.now(UTC).isoformat(), job_id),
+            (str(source), final_size, completed_at, job_id),
+        )
+        database.execute(
+            """
+            UPDATE bestand
+            SET grootte=?,mtime=?,nlink=?,device=?,inode=?,probe=?,gescand_op=?,
+                aanwezig=1,stabiel_vanaf=?,scan_status='gereed'
+            WHERE id=?
+            """,
+            (
+                final_size,
+                final_stat.st_mtime,
+                final_stat.st_nlink,
+                final_stat.st_dev,
+                final_stat.st_ino,
+                json.dumps(result_probe, ensure_ascii=False),
+                completed_at,
+                completed_at,
+                int(row["bestand_id"]),
+            ),
         )
         database.execute(
             """
@@ -422,6 +550,7 @@ async def run_job(
             (job_id, int(row["library_id"]), source_stat.st_size, final_size),
         )
         await refresh_after_replacement(database, settings, source, job_id)
+        _finish_attempt(database, job_id, "klaar")
         shutil.rmtree(cache_dir)
         return True
     except (ExecutionError, MetadataError, ReplacementError, OSError, ValueError) as exc:

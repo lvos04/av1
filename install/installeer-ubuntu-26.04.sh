@@ -43,9 +43,9 @@ add-apt-repository -y multiverse
 apt-get update
 apt-get install -y --no-install-recommends \
     ffmpeg mkvtoolnix mediainfo vainfo intel-media-va-driver-non-free \
-    libvpl2 libmfx-gen1.2 intel-gpu-tools \
+    libvpl2 libmfx-gen1.2 intel-gpu-tools linux-tools-common \
     python3 python3-venv python3-pip nodejs npm \
-    ca-certificates curl git jq sqlite3 openssl
+    ca-certificates curl git jq sqlite3 openssl cifs-utils acl attr
 
 # Profiel 7 mag alleen worden verwerkt als de vaste, gecontroleerde upstream-
 # binary aanwezig is; stil half uitvoeren is niet toegestaan.
@@ -91,6 +91,25 @@ fi
 install -d -o av1pipeline -g av1pipeline -m 0750 \
     /srv/av1-pipeline/cache /srv/av1-pipeline/work \
     /srv/av1-pipeline/config /srv/av1-pipeline/backups
+install -d -o root -g root -m 0755 /library/netwerk
+
+# De backend praat uitsluitend met deze root-owned, streng gevalideerde
+# socketservice; NoNewPrivileges blijft aan en er zijn geen sudo-rechten.
+install -o root -g root -m 0755 \
+    "$PROJECT_DIR/install/av1-pipeline-smb-helper.py" \
+    /usr/local/sbin/av1-pipeline-smb-helper
+install -o root -g root -m 0644 \
+    "$PROJECT_DIR/systemd/av1-pipeline-smb-helper.socket" \
+    /etc/systemd/system/av1-pipeline-smb-helper.socket
+install -o root -g root -m 0644 \
+    "$PROJECT_DIR/systemd/av1-pipeline-smb-helper@.service" \
+    /etc/systemd/system/av1-pipeline-smb-helper@.service
+rm -f /etc/sudoers.d/av1-pipeline-smb-helper
 
 systemctl daemon-reload
+systemctl enable --now av1-pipeline-smb-helper.socket
+# De applicaties starten pas wanneer de host daadwerkelijk boot of wanneer de
+# beheerder ze nu start; enable maakt een stroomherstel niet afhankelijk van
+# een later handmatig commando.
+systemctl enable av1-pipeline-backend.service av1-pipeline-frontend.service
 echo "Hostvoorbereiding klaar. Bouw nu de applicatie; start de services pas wanneer fase 0 groen is."

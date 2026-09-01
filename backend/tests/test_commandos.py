@@ -13,6 +13,7 @@ from conftest import pad
 from app.media import commandos
 from app.media.beslissen import STANDAARD, beslis
 from app.media.probe import probe
+from app.verificatie import verify_result
 
 LAAG = {"drempel_2160": 500, "drempel_1080": 500, "drempel_720": 300}
 
@@ -100,6 +101,31 @@ def test_hdr_herstel_met_mkvmerge(tmp_path):
     assert n["content_light"] == hdr["content_light"]
 
 
+def test_qsv_encode_en_herstel_lezen_hdr10_exact_terug(tmp_path):
+    """De volledige GPU-route telt pas als encode én teruglezing slagen."""
+
+    if not os.access("/dev/dri/renderD128", os.R_OK | os.W_OK):
+        pytest.skip("QSV-rendernode niet beschikbaar voor deze testgebruiker")
+    if not _heeft("mkvmerge"):
+        pytest.skip("mkvmerge niet aanwezig")
+    bron = pad("hdr10.mkv")
+    info = probe(bron)
+    besluit = beslis(info, {**LAAG, "gpu_voor_hdr10": True})
+    assert besluit.encoder == "av1_qsv"
+    assert besluit.herstel_hdr_na is True
+    kaal = str(tmp_path / "qsv-zonder-containerhdr.mkv")
+    hersteld = str(tmp_path / "qsv-hdr-hersteld.mkv")
+
+    draai(commandos.encode_gpu(info, besluit, STANDAARD, bron, kaal))
+    draai(commandos.herstel_hdr(info["md_ruw"], info["content_light"], kaal, hersteld))
+
+    resultaat = probe(hersteld)
+    assert resultaat["codec"] == "av1"
+    assert resultaat["is_hdr10"] is True
+    assert resultaat["mastering_display"] == info["mastering_display"]
+    assert resultaat["content_light"] == info["content_light"]
+
+
 def _heeft(tool):
     import shutil
 
@@ -136,7 +162,73 @@ def test_dolby_vision_overleeft_de_encode(tmp_path):
     assert n["codec"] == "av1"
     assert n["dv_profile"] == 10, "Dolby Vision is verdwenen"
     assert n["is_hdr10"] is True, "de HDR10-basislaag is verdwenen"
+    assert n["mastering_display"] == i["mastering_display"]
+    assert n["content_light"] == i["content_light"]
     assert len(n["audio"]) == len(i["audio"]), "audio kwijt"
+
+
+def test_nul_content_light_overleeft_als_semantisch_lege_av1_record(tmp_path):
+    """SVT-AV1 laat MaxCLL=0/MaxFALL=0 weg; dat is geen metadatawijziging."""
+
+    bron = str(tmp_path / "nul-content-light.mkv")
+    resultaat = str(tmp_path / "resultaat.mkv")
+    draai(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=1000:duration=1",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "hdr10=1:repeat-headers=1:"
+            "master-display=G(13250,34500)B(7500,3000)R(34000,16000)"
+            "WP(15635,16450)L(10000000,1):max-cll=0,0",
+            "-c:a",
+            "aac",
+            bron,
+        ]
+    )
+    source_probe = probe(bron)
+    assert source_probe["content_light"] == "0,0"
+    decision = beslis(source_probe, {**LAAG, "drempel_720": 1})
+    assert decision.actie == "hercoderen"
+    draai(
+        commandos.encode_cpu(
+            source_probe,
+            decision,
+            {**STANDAARD, "preset_720": 12, "crf_720": 45},
+            bron,
+            resultaat,
+        )
+    )
+
+    result_probe = probe(resultaat)
+    assert result_probe["content_light"] in {"", "0,0"}
+    verification = verify_result(
+        source_probe,
+        tmp_path / "resultaat.mkv",
+        10**9,
+        decision,
+    )
+    assert verification.passed is True
+    assert verification.mastering_equal is True
 
 
 def test_zonder_expliciete_vlag_gaat_dv_verloren(tmp_path):

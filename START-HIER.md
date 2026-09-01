@@ -7,9 +7,15 @@ Deze editie is voor **Ubuntu Server 26.04 LTS, native op de host**. Er draait
 geen Docker: de backend en frontend worden systemd-services. Zie `install/` en
 `systemd/` voordat je met fase 0 begint.
 
-**Wat je krijgt:** een pipeline die je bibliotheek scant, per bestand beslist
-wat er moet gebeuren, jou dat laat goedkeuren, en het daarna op twee banen
-tegelijk uitvoert — Intel Arc voor SDR 1080p, CPU voor 4K en HDR — met een
+Na installatie blijft de backend lokaal afgeschermd. Via **Instellingen →
+Toegang vanaf andere computers** kun je de webinterface met een apart
+wachtwoord beschikbaar maken op poort 3000 van het eigen thuisnetwerk.
+
+**Wat je krijgt:** een pipeline die je bibliotheek incrementeel en gepland
+scant, per bestand deterministisch beslist en na canary-vrijgave uitsluitend
+veilige categorieën door een begrensde AI-policy laat bevestigen. Afwijkingen
+blijven voor jou wachten. Daarna voert hij uit op Intel Arc voor SDR 1080p en
+CPU voor 4K/HDR (op hosts onder 24 GiB één mediajob totaal), met een
 React-dashboard waarin je realtime fps, ETA, GPU- en CPU-belasting, bitrate,
 besparing, fouten en logs ziet.
 

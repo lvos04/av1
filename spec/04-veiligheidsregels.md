@@ -10,8 +10,12 @@ als het "maar tijdelijk" of "alleen voor de test" is.
 
 ## 1. Besluiten en uitvoeren zijn gescheiden
 
-De scanner beslist. De worker voert uit. Daartussen zit **een tabel en jouw
-goedkeuring**.
+De scanner beslist. De worker voert uit. Daartussen zit **een tabel en een
+afzonderlijke goedkeuringspoort**. Standaard is dat jouw goedkeuring. Na een
+expliciet vrijgegeven canary mag de AI-controller alleen waarschuwingvrije,
+deterministische besluiten bevestigen wanneer scanner, getypeerd AI-voorstel
+en lokale Python-policy exact overeenkomen. Het model voert nooit zelf uit en
+heeft geen tools, shell, filesystem, mounts of SQLite-toegang.
 
 Dit is de belangrijkste architectuurkeuze van het project en de reden dat het
 veiliger is dan wat je kant-en-klaar krijgt. Je ziet de volledige lijst met
@@ -167,8 +171,23 @@ bestandssysteem staan. Is een netwerkshare of USB-schijf weg,
 dan start er geen job. De planner reserveert cache voor **alle** actieve jobs
 samen; niet tweemaal optimistisch dezelfde vrije ruimte tellen.
 
+Een nieuwe bibliotheek wordt pas opgeslagen na een eerste-gebruiktest met een
+verborgen tijdelijk bestand: schrijven en `fsync`, zichtbare metadata
+terugzetten, atomisch hernoemen, teruglezen en altijd opruimen. Lokale
+mediamappen mogen overal staan behalve in beschermde systeem- of
+pipelinepaden. Een SMB-URI bevat nooit accountgegevens; de vaste root-sockethelper
+mount alleen privé-netwerkshares onder `/library/netwerk`. Bij iedere scan en
+job moet `findmnt` opnieuw exact dezelfde CIFS `server/share` aantonen.
+
 ## 18. Veiligheidslagen zijn geen optie
 
-Verificatie, metadata-behoud, mountcontrole, hersteltransacties en handmatige
-goedkeuring kunnen niet via de interface worden uitgezet.
+Verificatie, metadata-behoud, mountcontrole, hersteltransacties en de
+goedkeurings- of strengere begrensde policy-poort kunnen niet via de interface
+worden uitgezet. HDR10+, Dolby Vision, hardlinks, permanent opruimen,
+canary-vrijgave, encoderwissels en iedere verificatie-, metadata-, mount- of
+herstelstoring blijven handmatig of geblokkeerd. Een uitvoerfout, inclusief
+een OOM/process-kill, mag volgens de expliciete eigenaarskeuze exact één
+automatische herstelpoging krijgen: tijdelijke joboutput wordt eerst
+gecontroleerd verwijderd, de oorspronkelijke bron blijft onaangeraakt en een
+tweede fout wordt nooit automatisch opnieuw gestart.
 Optionele gemaksfuncties wel. Zie `08-opslag-herstel-en-schakelaars.md`.

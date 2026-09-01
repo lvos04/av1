@@ -8,6 +8,7 @@ const nextConfig: NextConfig = {
       { source: "/api/:path*", destination: `${backend}/api/:path*` },
       { source: "/docs", destination: `${backend}/docs` },
       { source: "/openapi.json", destination: `${backend}/openapi.json` },
+      { source: "/ws", destination: `${backend}/ws` },
     ];
   },
 };

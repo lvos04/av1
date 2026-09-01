@@ -16,6 +16,10 @@ tegelijk werken.
 Persoonlijk project, één gebruiker, eigen netwerk. Geen multi-tenant, geen
 schaalbaarheid, geen microservices.
 
+LAN-bediening loopt uitsluitend via de beveiligde frontend-gateway op poort
+3000. FastAPI blijft op `127.0.0.1:8000`; open die backendpoort nooit op het
+netwerk. LAN-toegang is standaard uit en vereist een apart wachtwoord in de UI.
+
 ## Stack
 
 - **Backend**: Python 3 in een virtual environment, FastAPI, SQLite (WAL),
@@ -57,8 +61,10 @@ nooit half uitvoeren.
 
 Staan voluit in `spec/04-veiligheidsregels.md`. De kern:
 
-1. **Besluiten en uitvoeren zijn gescheiden.** De scanner beslist, de gebruiker
-   keurt goed, pas dan draait er iets.
+1. **Besluiten en uitvoeren zijn gescheiden.** De scanner beslist; daarna keurt
+   de gebruiker goed of bevestigt de begrensde AI-controller uitsluitend een
+   exact policy-toegestaan besluit. Pas daarna draait er iets. AI kan deze
+   Python-policy nooit omzeilen.
 2. **Het origineel wordt nooit overschreven vóór verificatie.** Encoderen naar
    de cache, controleren, dan pas vervangen.
 3. **Verifiëren doe je met metadata van vóór de encode.** Vastgelegd op de job.
@@ -78,6 +84,12 @@ Staan voluit in `spec/04-veiligheidsregels.md`. De kern:
    bibliotheekfilesystem zelf.
 10. **Bestandsrechten en hersteltransacties zijn verplicht.** Deze onderdelen
    zijn niet via de UI uitschakelbaar.
+11. **Iedere bibliotheekbron krijgt vóór opslag een eerste-gebruiktest.** Lokale
+    mediamappen mogen buiten `/library` staan. SMB-bronnen worden alleen via de
+    vaste root-owned sockethelper onder `/library/netwerk` gemount; de backend
+    behoudt `NoNewPrivileges` en krijgt nooit sudo- of algemene mountrechten.
+    Scanner en worker controleren bij
+    ieder gebruik opnieuw bron-URI, filesystem en device.
 
 Lees voor beheerfuncties, kwaliteitscontrole, instellingen en externe
 koppelingen ook `spec/07-bediening-en-beheer.md`. API-sleutels zijn geheimen:
@@ -126,7 +138,7 @@ falen stil.
 ## Mappen op de host
 
 ```
-/library                         je media, read-write
+/library/netwerk                uitsluitend beheerde SMB-automounts
 /srv/av1-pipeline/cache          standaardcache op systeemschijf
 /srv/av1-pipeline/config         vaste SQLite, opslagkeuze en logs
 # later optioneel, uitsluitend na UI-keuze:
@@ -136,6 +148,12 @@ falen stil.
 De cache staat buiten `/library`: een half afgemaakte encode mag Jellyfin
 nooit zien.
 
+Lokale libraries mogen op ieder bestaand absoluut mediapad staan zolang
+`av1pipeline` daar kan lezen, schrijven en openen en het pad geen beschermde
+systeem- of pipelineopslag is. De UI test een nieuwe lokale of SMB-bron met een
+verborgen tijdelijk bestand en verwijdert dat altijd vóór de library wordt
+opgeslagen.
+
 ## Waar je bent
 
 Werk de fasen af uit `prompts/`, op volgorde. Elke fase heeft een
@@ -143,5 +161,5 @@ acceptatietest; ga niet door voordat die groen is.
 
 <!-- Houd hieronder bij waar je bent gebleven. -->
 
-**Huidige fase:** voltooid — single-diskmodus gereed; wacht op library, rebootcontrole en menselijke duur-/tv-test
-**Klaar:** 0 — scaffold/host; 1 — analyse/DV; 2 — catalogus; 3 — veilige uitvoering, metadata/ACL/xattr, verificatie en atomische vervanging; 4 — wachtrij en workers; 5 — REST-API, WebSocket en systeembewaking; 6 — Next.js-frontend, live dashboard, gevirtualiseerde wachtrij en workers; 7 — beslissingen, bibliotheken, profielen, logs en gegroepeerde fouten; 8 — verificatiebadge, echte profielproef, voor/na, VMAF-detectie en versleutelde Jellyfin/Radarr/Sonarr-koppelingen; 9 — onderhoud, cachegrenzen, logrotatie en 100.000-job schaaltest; 10 — instellingen, hardwarediagnose, integraties, hardlinkbevestiging en toegankelijk beheer; 11 — single-diskbescherming, UI-opslagkeuze, crashherstel, schakelaars, back-upmanifesten en canary-planner
+**Huidige fase:** automatische scans en begrensde AI-controller gebouwd; wacht op schaduwevaluatie, library-canary, rebootcontrole en duurtest
+**Klaar:** 0 — scaffold/host; 1 — analyse/DV; 2 — catalogus; 3 — veilige uitvoering, metadata/ACL/xattr, verificatie en atomische vervanging; 4 — wachtrij en workers; 5 — REST-API, WebSocket en systeembewaking; 6 — Next.js-frontend, live dashboard, gevirtualiseerde wachtrij en workers; 7 — beslissingen, bibliotheken, profielen, logs en gegroepeerde fouten; 8 — verificatiebadge, echte profielproef, voor/na, VMAF-detectie en versleutelde Jellyfin/Radarr/Sonarr-koppelingen; 9 — onderhoud, cachegrenzen, logrotatie en 100.000-job schaaltest; 10 — instellingen, hardwarediagnose, integraties, hardlinkbevestiging en toegankelijk beheer; 11 — single-diskbescherming, UI-opslagkeuze, crashherstel, schakelaars, back-upmanifesten en canary-planner; 12 — incrementele scanscheduler, stabiliteitsvenster, pogingshistorie en begrensde AI-controller

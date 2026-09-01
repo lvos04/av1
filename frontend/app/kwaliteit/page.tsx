@@ -10,6 +10,9 @@ import { api, mutation } from "@/lib/api";
 import { bytes, fileName } from "@/lib/utils";
 import type {
   DecisionItem,
+  DolbyVisionOverview,
+  Job,
+  JobsResponse,
   Profile,
   QualityTrial,
   Verification,
@@ -23,10 +26,78 @@ interface QualityStatus {
 
 interface DecisionResponse {
   items: DecisionItem[];
+  totaal: number;
+}
+
+function buildDolbyVisionOverview(
+  decisions: DecisionResponse,
+  jobs: Job[],
+  verifications: Verification[],
+): DolbyVisionOverview {
+  const detected = new Map<number, number>();
+  const latestDecision = new Map<number, DecisionItem>();
+  for (const decision of decisions.items) {
+    latestDecision.set(decision.bestand_id, decision);
+    const match = /DV profiel (\d+)/.exec(decision.reden);
+    if (match) detected.set(decision.bestand_id, Number(match[1]));
+  }
+  const relevantJob = new Map<number, Job>();
+  const priority = (job: Job) => ["wacht", "bezig", "verifieren"].includes(job.status)
+    ? 0
+    : job.status === "klaar" ? 1 : 2;
+  for (const job of jobs) {
+    const current = relevantJob.get(job.bestand_id);
+    if (!current || priority(job) < priority(current) || (priority(job) === priority(current) && job.id > current.id)) {
+      relevantJob.set(job.bestand_id, job);
+    }
+  }
+  const verificationByJob = new Map(verifications.map((row) => [row.job_id, row]));
+  const profiles = { "5": 0, "7": 0, "8": 0, overig: 0 };
+  const items = [...detected.entries()].map(([fileId, profile]) => {
+    const decision = latestDecision.get(fileId);
+    const job = relevantJob.get(fileId);
+    const verification = job ? verificationByJob.get(job.id) : undefined;
+    const profileKey = String(profile) as "5" | "7" | "8";
+    if (profileKey in profiles) profiles[profileKey] += 1;
+    else profiles.overig += 1;
+    const controleStatus = verification
+      ? verification.geslaagd ? "geverifieerd" as const : "afgekeurd" as const
+      : job && ["wacht", "bezig", "verifieren"].includes(job.status)
+        ? "wacht_op_resultaat" as const
+        : decision?.actie === "overslaan"
+          ? "veilig_overgeslagen" as const
+          : "niet_ingepland" as const;
+    return {
+      bestand_id: fileId,
+      pad: decision?.pad ?? job?.pad ?? "Onbekend bestand",
+      dv_profile: profile,
+      dv_compat: 0,
+      is_hdr10: profile === 5 ? 0 : 1,
+      besluit_id: decision?.id ?? null,
+      besluit_actie: decision?.actie ?? null,
+      besluit_status: decision?.status ?? null,
+      reden: decision?.reden ?? null,
+      job_id: job?.id ?? null,
+      job_status: job?.status ?? null,
+      dv_bron: verification?.dv_bron ?? null,
+      dv_resultaat: verification?.dv_resultaat ?? null,
+      verificatie_geslaagd: verification?.geslaagd ?? null,
+      verificatie_toelichting: verification?.toelichting ?? null,
+      controle_status: controleStatus,
+    };
+  }).sort((left, right) => left.pad.localeCompare(right.pad, "nl"));
+  return {
+    totaal: items.length,
+    profielen: profiles,
+    items,
+    afgekapt: decisions.totaal > decisions.items.length,
+    uitleg: "Bronprofiel komt uit de catalogusscan; resultaatprofiel verschijnt pas na een volledige encode en verplichte verificatie.",
+  };
 }
 
 export default function QualityPage() {
   const [status, setStatus] = useState<QualityStatus | null>(null);
+  const [dolbyVision, setDolbyVision] = useState<DolbyVisionOverview | null>(null);
   const [rows, setRows] = useState<Verification[]>([]);
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [files, setFiles] = useState<DecisionItem[]>([]);
@@ -48,9 +119,11 @@ export default function QualityPage() {
       api<Verification[]>("/kwaliteit/verificaties"),
       api<Profile[]>("/profielen"),
       api<DecisionResponse>("/besluiten/items?per_pagina=500"),
+      api<JobsResponse>("/jobs?per_pagina=250"),
     ])
-      .then(([quality, verifications, loadedProfiles, decisions]) => {
+      .then(([quality, verifications, loadedProfiles, decisions, loadedJobs]) => {
         setStatus(quality);
+        setDolbyVision(buildDolbyVisionOverview(decisions, loadedJobs.items, verifications));
         setRows(verifications);
         setProfiles(loadedProfiles);
         setFiles(decisions.items);
@@ -89,6 +162,47 @@ export default function QualityPage() {
       <Card className="quality-card">
         <div className="worker-header">
           <div>
+            <h2>Dolby Vision-controle</h2>
+            <span className="muted">Bronherkenning, geplande behandeling en resultaatcontrole staan hier los van elkaar.</span>
+          </div>
+          <Badge tone={dolbyVision?.totaal ? "blue" : "neutral"}>
+            {dolbyVision ? `${dolbyVision.totaal} DV-bronnen herkend` : "controleren…"}
+          </Badge>
+        </div>
+        {dolbyVision ? <>
+          <p>{dolbyVision.uitleg}</p>
+          <div className="library-numbers">
+            <span><strong>{dolbyVision.profielen["5"]}</strong> profiel 5 · altijd overslaan</span>
+            <span><strong>{dolbyVision.profielen["7"]}</strong> profiel 7 · dovi_tool vereist</span>
+            <span><strong>{dolbyVision.profielen["8"]}</strong> profiel 8 · resultaat wordt profiel 10</span>
+          </div>
+          {dolbyVision.items.length ? <table className="data-table"><thead><tr><th>Bestand</th><th>Bron</th><th>Behandeling</th><th>DV-resultaatcontrole</th></tr></thead><tbody>{dolbyVision.items.map((item) => {
+            const tone = item.controle_status === "geverifieerd" ? "green" : item.controle_status === "afgekeurd" ? "red" : item.controle_status === "wacht_op_resultaat" ? "blue" : "neutral";
+            const resultText = item.controle_status === "geverifieerd"
+              ? `Profiel ${item.dv_bron} → ${item.dv_resultaat} geverifieerd`
+              : item.controle_status === "afgekeurd"
+                ? item.verificatie_toelichting ?? "DV-verificatie afgekeurd"
+                : item.controle_status === "wacht_op_resultaat"
+                  ? "Nog geen resultaat; controle volgt na de encode"
+                  : item.controle_status === "veilig_overgeslagen"
+                    ? "Geen resultaat nodig; bron blijft onaangeraakt"
+                    : "Nog niet ingepland";
+            const sourceText = item.dv_profile === 5
+              ? "Profiel 5 · geen HDR10-terugval"
+              : item.dv_profile === 7
+                ? "Profiel 7 · dual layer"
+                : item.dv_compat
+                  ? `Profiel ${item.dv_profile} · HDR-compat ${item.dv_compat}`
+                  : `Profiel ${item.dv_profile}`;
+            return <tr key={item.bestand_id}><td><strong>{fileName(item.pad)}</strong><br/><span className="muted mono">{item.pad}</span></td><td>{sourceText}</td><td>{item.job_id ? `Job #${item.job_id} · ${item.job_status}` : item.reden ?? "Nog geen besluit"}</td><td><Badge tone={tone}>{resultText}</Badge></td></tr>;
+          })}</tbody></table> : <p className="empty-state">Geen Dolby Vision-bronnen in de catalogus gevonden.</p>}
+          {dolbyVision.afgekapt ? <p className="muted">De eerste 500 DV-bronnen worden getoond.</p> : null}
+        </> : <p className="muted">Dolby Vision-catalogus wordt geladen…</p>}
+      </Card>
+
+      <Card className="quality-card">
+        <div className="worker-header">
+          <div>
             <h2>Profiel proefrijden</h2>
             <span className="muted">Tijdelijke SVT-AV1-encodes op CRF 27, 29 en 31.</span>
           </div>
@@ -119,7 +233,7 @@ export default function QualityPage() {
         <div className="verification-grid">
           <Check ok={row.hdr_bron === row.hdr_resultaat} text={row.hdr_bron ? "HDR10-status behouden" : "SDR-status behouden"} />
           <Check ok={Boolean(row.md_gelijk)} text="HDR10 mastering display identiek" />
-          <Check ok={row.dv_bron === row.dv_resultaat || row.dv_resultaat === 10} text={`Dolby Vision bron ${row.dv_bron || "geen"} · resultaat ${row.dv_resultaat || "geen"}`} />
+          <Check ok={row.dv_bron === row.dv_resultaat || row.dv_resultaat === 10} text={row.dv_bron ? `Dolby Vision bron ${row.dv_bron} · resultaat ${row.dv_resultaat || "ontbreekt"}` : "Deze bron bevat geen Dolby Vision"} />
           <Check ok={row.audio_resultaat > 0 && row.audio_resultaat <= row.audio_bron} text={`${row.audio_resultaat} audiosporen behouden (was ${row.audio_bron})`} />
           <Check ok={row.attachments_resultaat >= row.attachments_bron} text={`${row.attachments_resultaat} attachments behouden`} />
         </div>
