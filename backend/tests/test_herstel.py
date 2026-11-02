@@ -17,13 +17,15 @@ class PowerLoss(BaseException):
     """Bootst een proces- of stroomuitval na een persistente protocolstap na."""
 
 
-def _case(tmp_path: Path) -> tuple[Database, Settings, Path, Path, int, str, str]:
+def _case(
+    tmp_path: Path, *, source_name: str = "film.mkv"
+) -> tuple[Database, Settings, Path, Path, int, str, str]:
     roots = {name: tmp_path / name for name in ("cache", "work", "config", "backups")}
     for path in roots.values():
         path.mkdir()
     library = tmp_path / "library"
     library.mkdir()
-    source = library / "film.mkv"
+    source = library / source_name
     source.write_bytes(b"originele-media" * 100)
     source.chmod(0o640)
     os.setxattr(source, "user.av1-hersteltest", b"behouden")
@@ -145,3 +147,56 @@ def test_gewijzigde_bron_wordt_conflict_en_nooit_een_automatische_gok(tmp_path: 
     transaction = database.fetch_one("SELECT status,tijdelijk_pad FROM vervang_transactie")
     assert transaction is not None and transaction["status"] == "conflict"
     assert Path(str(transaction["tijdelijk_pad"])).is_file()
+
+
+def test_herstel_laat_nieuwere_actieve_job_eigenaar_blijven(tmp_path: Path) -> None:
+    database, configured, source, result, job_id, _old_hash, _new_hash = _case(tmp_path)
+
+    def crash(step: str) -> None:
+        if step == "gestart":
+            raise PowerLoss(step)
+
+    with pytest.raises(PowerLoss):
+        atomic_replace(database, job_id, source, result, capture_metadata(source), after_step=crash)
+    database.execute("UPDATE job SET status='fout' WHERE id=?", (job_id,))
+    decision_id = database.execute_insert(
+        """
+        INSERT INTO besluit(bestand_id,actie,baan,reden,payload,gemaakt_op)
+        SELECT bestand_id,'hercoderen','cpu','nieuwste besluit','{}',CURRENT_TIMESTAMP
+        FROM job WHERE id=?
+        """,
+        (job_id,),
+    )
+    newer_job_id = database.execute_insert(
+        """
+        INSERT INTO job(besluit_id,bestand_id,baan,status)
+        SELECT ?,bestand_id,'cpu','wacht' FROM job WHERE id=?
+        """,
+        (decision_id, job_id),
+    )
+
+    outcomes = recover_replacements(database, configured)
+
+    assert outcomes[0]["status"] == "hersteld"
+    assert database.fetch_one("SELECT status FROM job WHERE id=?", (job_id,))[0] == (
+        "overgeslagen"
+    )
+    assert database.fetch_one("SELECT status FROM job WHERE id=?", (newer_job_id,))[0] == "wacht"
+
+
+def test_vervanging_werkt_met_bronnaam_dicht_bij_name_max(tmp_path: Path) -> None:
+    lange_naam = f"{'x' * 240}.mkv"
+    database, _configured, source, result, job_id, _old_hash, new_hash = _case(
+        tmp_path, source_name=lange_naam
+    )
+
+    atomic_replace(database, job_id, source, result, capture_metadata(source))
+
+    assert source.name == lange_naam
+    assert source.is_file()
+    assert file_sha256(source) == new_hash
+    transaction = database.fetch_one(
+        "SELECT status,tijdelijk_pad FROM vervang_transactie WHERE job_id=?", (job_id,)
+    )
+    assert transaction is not None and transaction["status"] == "vervangen"
+    assert len(Path(str(transaction["tijdelijk_pad"])).name.encode()) < 255

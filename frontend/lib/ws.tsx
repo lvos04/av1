@@ -40,6 +40,15 @@ function websocketUrl(): string {
   return `${protocol}//${window.location.host}/ws`;
 }
 
+function chartTime(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleTimeString("nl-NL", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function mergeWorkers(previous: LiveWorker[], current: LiveWorker[]): LiveWorker[] {
   return current.map((worker) => {
     const old = previous.find(
@@ -93,6 +102,18 @@ export function LiveProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => undefined);
 
+    fetch("/api/systeem/metingen?uren=1", { cache: "no-store" })
+      .then((response) => response.ok ? response.json() : [])
+      .then((value: unknown) => {
+        if (!Array.isArray(value)) return;
+        const history = value.map((item) => {
+          const metric = item as LiveState["metrics"][number];
+          return { ...metric, tijd: chartTime(metric.tijd) };
+        }).slice(-3600);
+        setMetrics((old) => [...history, ...old].slice(-3600));
+      })
+      .catch(() => undefined);
+
     const connect = () => {
       if (stopped) return;
       const connection = new WebSocket(websocketUrl());
@@ -114,11 +135,7 @@ export function LiveProvider({ children }: { children: ReactNode }) {
           setMetrics((old) => [
             ...old.slice(-3599),
             {
-              tijd: new Date().toLocaleTimeString("nl-NL", {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              }),
+              tijd: chartTime(new Date().toISOString()),
               cpu: value.systeem.cpu_percent,
               gpuVideo: value.systeem.gpu.beschikbaar
                 ? value.systeem.gpu.video_percent : null,

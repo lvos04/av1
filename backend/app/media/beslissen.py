@@ -21,9 +21,25 @@ STANDAARD: dict[str, Any] = {
     "drempel_720": 4000,
     "crf_2160": 27,
     "crf_1080": 29,
+    "crf_720": 31,
+    # 0 = kwaliteitsgestuurd met CRF. Een waarde > 0 is een gemiddelde
+    # doelbitrate in kbps; de encoder krijgt daarnaast een ruime VBV-band.
+    # 6500 kbps is een bruikbaar startpunt voor 4K-DV op deze host.
+    "doel_bitrate_2160_kbps": 6500,
+    "doel_bitrate_1080_kbps": 0,
+    "doel_bitrate_720_kbps": 0,
     "preset_2160": 8,
     "preset_1080": 6,
+    "preset_720": 6,
+    # 0 = automatisch. De uitvoerder kiest dan op basis van beschikbaar RAM
+    # een veilige SVT-paralleliteit; een expliciete waarde blijft begrensd.
+    "svt_threads_2160": 0,
+    "svt_threads_1080": 0,
+    "svt_threads_720": 0,
     "gpu_quality": 28,
+    # Alleen de begrensde jobretry mag dit tijdelijk verlagen. Het profiel
+    # houdt 64 voor normale QSV-doorvoer.
+    "gpu_extra_hw_frames": 64,
     "gpu_voor_sdr_1080": True,
     "gpu_voor_sdr_4k": False,
     "gpu_voor_hdr10": False,

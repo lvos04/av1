@@ -142,7 +142,7 @@ export default function QueuePage() {
                   <Badge tone={job.status === "mislukt" ? "red" : job.status === "klaar" ? "green" : job.status === "bezig" ? "blue" : "neutral"}>{job.status}</Badge>
                   <Badge tone={job.baan === "gpu" ? "blue" : "purple"}>{job.baan}</Badge>
                   <span className="mono">{job.encoder}</span>
-                  <span className="reason-cell">{job.reden}</span><span className="mono">{bytes(job.bron_grootte)}</span>
+                  <span className="reason-cell">{job.reden}{job.kwaliteitsadvies ? <small className="muted">{job.kwaliteitsadvies}</small> : null}</span><span className="mono">{bytes(job.bron_grootte)}</span>
                 </div>
               );
             })}

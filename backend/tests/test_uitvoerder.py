@@ -4,7 +4,9 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -67,15 +69,37 @@ def _case(tmp_path: Path, source_name: str = "hdr10.mkv") -> tuple[Database, Set
 
 
 @pytest.mark.asyncio
-async def test_hdr_wordt_pas_na_verificatie_atomisch_vervangen(tmp_path: Path) -> None:
+async def test_hdr_wordt_pas_na_verificatie_atomisch_vervangen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database, configured, source, job_id = _case(tmp_path)
     source.chmod(0o640)
     source_xattr = b"blijft-behouden"
     os.setxattr(source, "user.av1-test", source_xattr)
     subprocess.run(["setfacl", "-m", "u:daemon:r--", str(source)], check=True)
     before_hash = file_sha256(source)
+    event_loop_thread = threading.get_ident()
+    replacement_threads: list[int] = []
+    promotion_threads: list[int] = []
+    from app import uitvoerder
+
+    real_atomic_replace = uitvoerder.atomic_replace
+    real_promote_partial = uitvoerder._promote_partial
+
+    def observed_atomic_replace(*args, **kwargs) -> None:
+        replacement_threads.append(threading.get_ident())
+        real_atomic_replace(*args, **kwargs)
+
+    def observed_promote_partial(*args, **kwargs) -> None:
+        promotion_threads.append(threading.get_ident())
+        real_promote_partial(*args, **kwargs)
+
+    monkeypatch.setattr(uitvoerder, "atomic_replace", observed_atomic_replace)
+    monkeypatch.setattr(uitvoerder, "_promote_partial", observed_promote_partial)
 
     assert await run_job(database, configured, job_id, storage_validator=lambda: None)
+    assert replacement_threads and replacement_threads[0] != event_loop_thread
+    assert promotion_threads and promotion_threads[0] != event_loop_thread
 
     result_probe = probe(str(source))
     assert result_probe is not None and result_probe["is_hdr10"] is True
@@ -201,7 +225,7 @@ async def test_grotere_opschoonremux_is_veilig_geen_besparing(tmp_path: Path) ->
         "UPDATE besluit SET actie='opschonen',payload=? WHERE id=?",
         (json.dumps(payload), decision_id),
     )
-    partial = configured.cache_root / str(job_id) / f"{source.name}.deel"
+    partial = configured.cache_root / str(job_id) / "resultaat.mkv.deel"
     script = (
         "import pathlib,shutil,sys;shutil.copyfile(sys.argv[1],sys.argv[2]);"
         "pathlib.Path(sys.argv[2]).open('ab').write(b'x')"
@@ -223,3 +247,122 @@ async def test_grotere_opschoonremux_is_veilig_geen_besparing(tmp_path: Path) ->
     assert database.fetch_one(
         "SELECT status FROM job_poging WHERE job_id=?", (job_id,)
     )[0] == "overgeslagen"
+
+
+@pytest.mark.asyncio
+async def test_lange_bronnaam_werkt_in_cache_en_bij_vervanging(tmp_path: Path) -> None:
+    database, configured, source, job_id = _case(tmp_path, "sdr-meertalig.mkv")
+    long_source = source.with_name(f"{'lange-aflevering-' * 14}x.mkv")
+    source.rename(long_source)
+    database.execute(
+        "UPDATE bestand SET pad=? WHERE id=(SELECT bestand_id FROM job WHERE id=?)",
+        (str(long_source), job_id),
+    )
+    decision_id = int(
+        database.fetch_one("SELECT besluit_id FROM job WHERE id=?", (job_id,))[0]
+    )
+    payload = json.loads(
+        str(database.fetch_one("SELECT payload FROM besluit WHERE id=?", (decision_id,))[0])
+    )
+    payload["actie"] = "opschonen"
+    database.execute(
+        "UPDATE besluit SET actie='opschonen',payload=? WHERE id=?",
+        (json.dumps(payload), decision_id),
+    )
+
+    assert await run_job(database, configured, job_id, storage_validator=lambda: None)
+    assert long_source.is_file()
+    assert database.fetch_one("SELECT status FROM job WHERE id=?", (job_id,))[0] == "klaar"
+
+
+@pytest.mark.asyncio
+async def test_tijdelijk_sqliteprobleem_stopt_lopend_mediaproces_niet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, configured, _source, job_id = _case(tmp_path, "sdr-meertalig.mkv")
+    from app import uitvoerder
+
+    real_fetch_one = database.fetch_one
+    failed_once = False
+
+    def flaky_fetch_one(sql, parameters=()):
+        nonlocal failed_once
+        if "afbreken_gevraagd" in sql and not failed_once:
+            failed_once = True
+            raise sqlite3.OperationalError("tijdelijk niet bereikbaar")
+        return real_fetch_one(sql, parameters)
+
+    monkeypatch.setattr(database, "fetch_one", flaky_fetch_one)
+    log_path = configured.config_root / "logs" / f"job-{job_id}.log"
+    log_path.parent.mkdir(parents=True)
+
+    succeeded = await uitvoerder._run_process(
+        database,
+        job_id,
+        [
+            "/usr/bin/python3",
+            "-u",
+            "-c",
+            "import time;print('out_time_ms=500000');time.sleep(0.6)",
+        ],
+        log_path,
+        1.0,
+    )
+
+    assert succeeded is True
+    assert failed_once is True
+
+
+@pytest.mark.asyncio
+async def test_sigterm_bij_serviceherstart_zet_job_terug_in_wachtrij(
+    tmp_path: Path,
+) -> None:
+    database, configured, source, job_id = _case(tmp_path, "sdr-meertalig.mkv")
+    before_hash = file_sha256(source)
+
+    result = await run_job(
+        database,
+        configured,
+        job_id,
+        storage_validator=lambda: None,
+        command_override=[
+            "/usr/bin/python3",
+            "-c",
+            "import os,signal;os.kill(os.getpid(),signal.SIGTERM)",
+        ],
+    )
+
+    assert result is False
+    job = database.fetch_one(
+        "SELECT status,fout,foutsoort,proces_pid FROM job WHERE id=?", (job_id,)
+    )
+    assert job is not None and job["status"] == "wacht"
+    assert "service- of systeemstop" in str(job["fout"])
+    assert job["foutsoort"] is None and job["proces_pid"] is None
+    assert not (configured.cache_root / str(job_id)).exists()
+    assert file_sha256(source) == before_hash
+
+
+@pytest.mark.asyncio
+async def test_snel_falend_proces_bewaart_fatale_laatste_logregel(tmp_path: Path) -> None:
+    database, configured, _source, job_id = _case(tmp_path, "sdr-meertalig.mkv")
+    script = (
+        "import sys;"
+        "print('eerste waarschuwing', flush=True);"
+        "print('fatale laatste regel', flush=True);"
+        "sys.exit(7)"
+    )
+
+    assert not await run_job(
+        database,
+        configured,
+        job_id,
+        storage_validator=lambda: None,
+        command_override=["/usr/bin/python3", "-c", script],
+    )
+
+    log = (configured.config_root / "logs" / f"job-{job_id}.log").read_text(
+        encoding="utf-8"
+    )
+    assert "eerste waarschuwing" in log
+    assert "fatale laatste regel" in log

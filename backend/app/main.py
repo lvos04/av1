@@ -19,6 +19,7 @@ from app.health import dependency_report
 from app.integraties import IntegrationMonitor
 from app.live import register_websocket
 from app.media.beslissen import STANDAARD
+from app.metingen import system_metrics_loop
 from app.onderhoud import maintenance_loop
 from app.opslag import storage_validation_error
 from app.planner import Planner
@@ -79,6 +80,9 @@ def create_app(
         planner_task: asyncio.Task[None] | None = None
         scan_scheduler_task: asyncio.Task[None] | None = None
         ai_controller_task: asyncio.Task[None] | None = None
+        system_metrics_task = asyncio.create_task(
+            system_metrics_loop(database, app_settings, application.state.gpu_monitor)
+        )
         integration_task = asyncio.create_task(application.state.integration_monitor.run_forever())
         maintenance_task = asyncio.create_task(maintenance_loop(database, app_settings))
         if start_planner:
@@ -106,6 +110,9 @@ def create_app(
         maintenance_task.cancel()
         with suppress(asyncio.CancelledError):
             await maintenance_task
+        system_metrics_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await system_metrics_task
         await application.state.gpu_monitor.stop()
         tasks: dict[str, asyncio.Task[object]] = application.state.background_tasks
         for task in tasks.values():

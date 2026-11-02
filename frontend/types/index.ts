@@ -106,6 +106,8 @@ export interface Job {
   resultaat_grootte: number | null;
   verificatie_geslaagd: number | null;
   verificatie_toelichting: string | null;
+  kwaliteitsadvies: string | null;
+  kwaliteitsadvies_status: string | null;
 }
 
 export interface JobsResponse {
@@ -192,6 +194,7 @@ export interface AiAnalysis {
   redencodes: string[];
   bewijsvelden: string[];
   vertrouwen: number | null;
+  retry_aanpassing: "geen" | "cpu_geheugen_veilig" | "gpu_geheugen_veilig" | "doelbitrate_verlagen";
 }
 
 export interface AiDayStatistics {

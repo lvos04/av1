@@ -90,11 +90,11 @@ tonen per lokale kalenderdag het token-/kostenverbruik en de aantallen besluiten
 per classificatie. De pagina toont nooit de API-sleutel of ruwe bronpaden die
 naar de provider zijn gestuurd.
 
-De OpenAI-provider gebruikt `gpt-5.6-luna` via de Responses API met
+De OpenAI-provider gebruikt `gpt-6-luna` via de Responses API met
 `reasoning.effort=medium`, Structured Outputs, `store:false`, maximaal 8.000
 inputtokens en 800 outputtokens per groep. De applicatie rekent met de
-[officiële modelprijzen](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
-van $0,20 per miljoen inputtokens en $1,20 per miljoen outputtokens en stopt
+[officiële modelprijzen](https://developers.openai.com/api/docs/models/gpt-6-luna)
+van $0,10 per miljoen inputtokens en $0,50 per miljoen outputtokens en stopt
 standaard bij $10 per kalendermaand. Volgens de
 [OpenAI Data Controls](https://developers.openai.com/api/docs/guides/your-data)
 wordt API-data niet voor training gebruikt; standaard abuse-monitoring kan
@@ -133,10 +133,16 @@ logregels, diagnose, gevolgen en veilige actie. Voorbeelden:
   worden opgeruimd wanneer het niet bij een actieve job hoort.
 
 Iedere mislukte uitvoerjob mag na een overeenkomend getypeerd AI-voorstel en
-lokale idempotentiecontrole exact één automatische herstelpoging krijgen. De
-eerste poging blijft volledig in `job_poging` bewaard. Mislukt poging twee,
-dan blijft de fout staan voor menselijke diagnose; encoder- en baanwissels
-gebeuren nooit als onderdeel van die retry.
+lokale idempotentiecontrole exact één automatische herstelpoging krijgen. Bij
+een encoderfout mag het voorstel alleen voor die job één allowlisted
+geheugeninstelling kiezen: één SVT-worker op CPU of een kleinere QSV-
+surfacebuffer op GPU. Dit geheugenherstel heeft een eigen UI-schakelaar. Alleen
+wanneer verificatie aantoont dat het resultaat groter is dan de bron, mag de
+lokale policy daarnaast voor die ene job een lagere doelbitrate berekenen.
+CRF, HDR, Dolby Vision, encoder, baan en het gedeelde profiel blijven
+ongewijzigd. De eerste poging blijft volledig in
+`job_poging` bewaard. Mislukt poging twee, dan blijft de fout staan voor
+menselijke diagnose.
 
 Een "driver reset" reset nooit een kernel-driver vanuit de webapp. Hij start
 hoogstens het optionele GPU-meetproces opnieuw en verwijst voor herstel van de

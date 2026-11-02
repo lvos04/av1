@@ -40,6 +40,33 @@ def test_cpu_encode_behoudt_hdr10(tmp_path):
     assert n["content_light"] == i["content_light"]
 
 
+def test_cpu_doelbitrate_gebruikt_svt_compatibele_abr(tmp_path):
+    """SVT-AV1 weigert maxrate in ABR-modus nog vóór het eerste frame."""
+
+    bron = pad("lage-bitrate.mkv")
+    uit = str(tmp_path / "doelbitrate.mkv")
+    info = probe(bron)
+    besluit = beslis(info, {**LAAG, "drempel_720": 1})
+    klasse = "2160" if info["height"] > 1200 else "1080" if info["height"] > 800 else "720"
+    opdracht = commandos.encode_cpu(
+        info,
+        besluit,
+        {
+            **STANDAARD,
+            f"preset_{klasse}": 12,
+            f"doel_bitrate_{klasse}_kbps": 500,
+        },
+        bron,
+        uit,
+    )
+
+    assert "-b:v" in opdracht
+    assert "-maxrate" not in opdracht
+    assert "-bufsize" not in opdracht
+    draai(opdracht)
+    assert probe(uit)["codec"] == "av1"
+
+
 def test_mp4_met_movtext_faalt_niet(tmp_path):
     """mov_text past niet in Matroska. Zonder omzetting faalt de mux met
     'Subtitle codec 94213 is not supported'."""
@@ -47,7 +74,9 @@ def test_mp4_met_movtext_faalt_niet(tmp_path):
     uit = str(tmp_path / "uit.mkv")
     i = probe(bron)
     b = beslis(i, {"drempel_720": 100000})
-    draai(commandos.opschonen(i, b, bron, uit))
+    opdracht = commandos.opschonen(i, b, bron, uit)
+    assert opdracht[0] == "ffmpeg"
+    draai(opdracht)
 
     n = probe(uit)
     assert n is not None
@@ -61,7 +90,9 @@ def test_opschonen_behoudt_lettertypen(tmp_path):
         pytest.skip("testbestand heeft geen attachment")
     uit = str(tmp_path / "uit.mkv")
     b = beslis(i, LAAG)
-    draai(commandos.opschonen(i, b, bron, uit))
+    opdracht = commandos.opschonen(i, b, bron, uit)
+    assert opdracht[0] == "mkvmerge"
+    draai(opdracht)
 
     assert probe(uit)["attachments"] == i["attachments"], "lettertypen weg"
 

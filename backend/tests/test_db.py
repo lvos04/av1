@@ -28,7 +28,7 @@ def test_migraties_zijn_herhaalbaar(tmp_path: Path) -> None:
     database.initialize()
     database.initialize()
 
-    assert database.applied_versions() == {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+    assert database.applied_versions() == set(range(1, 16))
     assert database.fetch_one("PRAGMA journal_mode")[0] == "wal"
     assert database.fetch_one("SELECT COUNT(*) FROM functie")[0] == 13
     assert database.fetch_one(

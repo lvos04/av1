@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import signal
@@ -27,12 +28,62 @@ from app.onderhoud import append_job_log, record_failure
 from app.verificatie import VerificationResult, verify_result
 from app.vervanging import ReplacementError, atomic_replace
 
+LOGGER = logging.getLogger(__name__)
+
 
 class ExecutionError(RuntimeError):
     """Een job is veilig gestopt; de bron is niet vervangen."""
 
 
+class ProcessInterrupted(RuntimeError):
+    """Het mediaproces kreeg extern SIGTERM, bijvoorbeeld bij een herstart."""
+
+
 VerificationHook = Callable[[VerificationResult], VerificationResult]
+
+
+def _promote_partial(partial: Path, result: Path) -> None:
+    """Flush een volledig encoderresultaat en maak het lokaal zichtbaar."""
+
+    with partial.open("rb") as handle:
+        os.fsync(handle.fileno())
+    partial.replace(result)
+
+
+def _kwaliteitsadvies(
+    source_size: int,
+    result_size: int,
+    source_probe: dict[str, Any],
+    profile: dict[str, Any],
+    decision: Besluit,
+) -> str:
+    """Geef een herhaalbaar, begrensd advies zonder ooit zelf profieldata te wijzigen."""
+
+    if decision.actie == "opschonen":
+        return (
+            "Resultaat was groter dan de bron. Advies: zo is het goed; de bron is "
+            "veilig behouden en alleen de tijdelijke remux is verwijderd."
+        )
+    hoogte = int(source_probe.get("height") or 0)
+    klasse = "2160" if hoogte > 1200 else "1080" if hoogte > 800 else "720"
+    target = int(profile.get(f"doel_bitrate_{klasse}_kbps") or 0)
+    if target > 0 and result_size > source_size:
+        verhouding = source_size / max(result_size, 1)
+        voorstel = max(500, int(target * verhouding * 0.9))
+        return (
+            f"Doelbitrate {target} kbps leverde geen besparing op. "
+            f"AI-advies: probeer ongeveer {voorstel} kbps of laat 0 (CRF) staan; "
+            "deze job is niet automatisch opnieuw gestart."
+        )
+    if int(source_probe.get("dv_profile") or 0):
+        return (
+            "DV-resultaat werd groter dan de bron. Advies: zo is het goed; "
+            "behoud de bron of verlaag de doelbitrate handmatig voordat je opnieuw test."
+        )
+    return (
+        "De gekozen kwaliteitsinstelling leverde geen kleinere video op. "
+        "Advies: verhoog CRF met 2–3 of laat de bron ongewijzigd; automatisch overslaan is veilig."
+    )
 
 
 def _finish_attempt(
@@ -143,9 +194,10 @@ async def _run_process(
         (process.pid, json.dumps(arguments), job_id),
     )
     started = asyncio.get_running_loop().time()
+    last_database_warning = 0.0
     progress: dict[str, str] = {}
     with log_path.open("a", encoding="utf-8") as log_handle:
-        while process.returncode is None:
+        while True:
             try:
                 line_bytes = (
                     await asyncio.wait_for(process.stdout.readline(), timeout=0.25)
@@ -158,11 +210,32 @@ async def _run_process(
                 line = line_bytes.decode("utf-8", errors="replace").rstrip()
                 log_handle.write(line + "\n")
                 if line and not line.startswith(("frame=", "out_time_", "fps=", "speed=")):
-                    append_job_log(database, job_id, "info", line)
+                    # Het volledige proceslog staat al veilig op schijf; een
+                    # kort SQLite-probleem mag de encoder niet doden.
+                    with suppress(sqlite3.OperationalError):
+                        append_job_log(database, job_id, "info", line)
                 key, separator, value = line.partition("=")
                 if separator and key in {"out_time_ms", "fps", "speed", "bitrate", "total_size"}:
                     progress[key] = value
-            abort = database.fetch_one("SELECT afbreken_gevraagd FROM job WHERE id=?", (job_id,))
+            elif process.returncode is not None:
+                # Een snel falend proces kan al gestopt zijn terwijl er nog
+                # fatale regels in de pipe staan. Lees tot EOF, anders blijft
+                # precies de nuttigste laatste fout uit het joblog.
+                break
+            try:
+                abort = database.fetch_one(
+                    "SELECT afbreken_gevraagd FROM job WHERE id=?", (job_id,)
+                )
+            except sqlite3.OperationalError as exc:
+                abort = None
+                now = asyncio.get_running_loop().time()
+                if now - last_database_warning >= 60:
+                    LOGGER.warning(
+                        "Job %s blijft encoderen tijdens tijdelijk SQLite-probleem: %s",
+                        job_id,
+                        exc,
+                    )
+                    last_database_warning = now
             if abort is not None and int(abort[0]):
                 os.killpg(process.pid, signal.SIGTERM)
                 with suppress(TimeoutError):
@@ -185,23 +258,29 @@ async def _run_process(
                         if speed is not None and speed > 0
                         else None
                     )
-                    database.execute(
-                        """
-                        UPDATE job SET percent=?,fps=?,speed=?,bitrate_kbps=?,eta_seconden=?
-                        WHERE id=?
-                        """,
-                        (
-                            percent,
-                            fps,
-                            speed,
-                            bitrate,
-                            eta,
-                            job_id,
-                        ),
-                    )
+                    # Voortgang is afleidbare telemetrie. De volgende seconde
+                    # probeert opnieuw; de encode blijft intact.
+                    with suppress(sqlite3.OperationalError):
+                        database.execute(
+                            """
+                            UPDATE job SET percent=?,fps=?,speed=?,bitrate_kbps=?,eta_seconden=?
+                            WHERE id=?
+                            """,
+                            (
+                                percent,
+                                fps,
+                                speed,
+                                bitrate,
+                                eta,
+                                job_id,
+                            ),
+                        )
                 started = now
             if process.returncode is None:
                 await asyncio.sleep(0)
+        await process.wait()
+        if process.returncode == -signal.SIGTERM:
+            raise ProcessInterrupted("mediaproces onderbroken door service- of systeemstop")
         return process.returncode == 0
 
 
@@ -285,8 +364,10 @@ async def run_job(
     cache_dir.mkdir(parents=True, exist_ok=False)
     work_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-    partial = cache_dir / f"{source.name}.deel"
-    result_path = cache_dir / f"{source.stem}.mkv"
+    # De jobmap is al uniek. Vaste korte namen voorkomen ENAMETOOLONG bij
+    # volkomen geldige bronbestanden waarvan de naam dicht bij NAME_MAX zit.
+    partial = cache_dir / "resultaat.mkv.deel"
+    result_path = cache_dir / "resultaat.mkv"
     try:
         source_stat = source.stat()
         if source_stat.st_size != int(row["grootte"]) or source_stat.st_mtime != float(
@@ -323,7 +404,34 @@ async def run_job(
         profile_raw: Any = json.loads(str(row["profiel_inst"]))
         if not isinstance(profile_raw, dict):
             raise ExecutionError("profielinstellingen zijn ongeldig")
-        profile = {**STANDAARD, **profile_raw}
+        override_raw: Any = json.loads(str(row["ai_encode_override"] or "{}"))
+        if not isinstance(override_raw, dict):
+            raise ExecutionError("AI-retryinstellingen zijn ongeldig")
+        adjustment = str(row["ai_retry_aanpassing"] or "geen")
+        valid_override = override_raw == {}
+        if adjustment == "cpu_geheugen_veilig":
+            valid_override = len(override_raw) == 1 and next(iter(override_raw), "") in {
+                "svt_threads_2160", "svt_threads_1080", "svt_threads_720"
+            } and next(iter(override_raw.values()), None) == 1
+        elif adjustment == "gpu_geheugen_veilig":
+            valid_override = override_raw == {"gpu_extra_hw_frames": 16}
+        elif adjustment == "doelbitrate_verlagen":
+            key = next(iter(override_raw), "")
+            value = next(iter(override_raw.values()), None)
+            valid_override = (
+                len(override_raw) == 1
+                and key in {
+                    "doel_bitrate_2160_kbps",
+                    "doel_bitrate_1080_kbps",
+                    "doel_bitrate_720_kbps",
+                }
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and 500 <= value <= 200_000
+            )
+        if not valid_override:
+            raise ExecutionError("AI-retryinstellingen vallen buiten de veilige allowlist")
+        profile = {**STANDAARD, **profile_raw, **override_raw}
         database.execute(
             """
             UPDATE job SET bron_probe=?,bron_grootte=?,bron_mtime=?,bron_bestandsmetadata=?,
@@ -408,12 +516,12 @@ async def run_job(
             raise ExecutionError("encoderproces faalde")
         if not partial.is_file():
             raise ExecutionError("encoder meldde succes maar resultaat ontbreekt")
-        with partial.open("rb") as handle:
-            os.fsync(handle.fileno())
-        partial.replace(result_path)
+        # Een meer-gigabytebestand kan bij fsync lang wachten op het lokale
+        # journal. Houd de API-eventloop ook tijdens die duurzame flush vrij.
+        await asyncio.to_thread(_promote_partial, partial, result_path)
 
         if decision.herstel_hdr_na:
-            restored = cache_dir / f"{source.stem}.hdr.mkv"
+            restored = cache_dir / "resultaat-hdr.mkv"
             hdr_command = commandos.herstel_hdr(
                 source_probe["md_ruw"],
                 source_probe["content_light"],
@@ -466,16 +574,24 @@ async def run_job(
             # Opschonen is alleen zinvol bij echte ruimtewinst. Een groter
             # resultaat is geen mediastoring: de bron blijft intact en de
             # tijdelijke remux wordt zonder retry verwijderd.
+            advice = _kwaliteitsadvies(
+                source_stat.st_size,
+                result_path.stat().st_size,
+                source_probe,
+                profile,
+                decision,
+            )
             database.execute(
                 """
                 UPDATE job SET status='overgeslagen',fout=?,foutsoort='GeenBesparing',
                                resultaat_pad=NULL,resultaat_grootte=NULL,klaar_op=?,
-                               proces_pid=NULL
+                               proces_pid=NULL,kwaliteitsadvies=?,kwaliteitsadvies_status='advies'
                 WHERE id=?
                 """,
                 (
                     "opschonen veilig overgeslagen: geen besparing",
                     datetime.now(UTC).isoformat(),
+                    advice,
                     job_id,
                 ),
             )
@@ -483,6 +599,19 @@ async def run_job(
             shutil.rmtree(cache_dir, ignore_errors=True)
             return False
         if not verification.passed:
+            if verification.reason == "resultaat is groter dan de bron":
+                advice = _kwaliteitsadvies(
+                    source_stat.st_size,
+                    result_path.stat().st_size,
+                    source_probe,
+                    profile,
+                    decision,
+                )
+                database.execute(
+                    "UPDATE job SET kwaliteitsadvies=?,kwaliteitsadvies_status='advies',"
+                    "resultaat_grootte=? WHERE id=?",
+                    (advice, result_path.stat().st_size, job_id),
+                )
             raise ExecutionError(f"verificatie mislukt: {verification.reason}")
 
         quality_frames = await capture_comparison_frames(
@@ -512,7 +641,13 @@ async def run_job(
                 ),
             )
 
-        atomic_replace(database, job_id, source, result_path, metadata)
+        # Een resultaat van meerdere gigabytes hashen en naar hetzelfde
+        # libraryfilesystem kopiëren kan op SMB minuten duren. Dit is gewone
+        # blokkerende bestands-I/O en mag daarom niet de FastAPI-eventloop (en
+        # daarmee dashboard, pauzeknoppen en AI-controller) stilzetten.
+        await asyncio.to_thread(
+            atomic_replace, database, job_id, source, result_path, metadata
+        )
         final_stat = source.stat()
         final_size = final_stat.st_size
         completed_at = datetime.now(UTC).isoformat()
@@ -553,6 +688,48 @@ async def run_job(
         _finish_attempt(database, job_id, "klaar")
         shutil.rmtree(cache_dir)
         return True
+    except ProcessInterrupted as exc:
+        # Een beheerherstart of nette systeemstop is geen encodefout. Verwijder
+        # alleen de onvolledige cache en zet dezelfde goedgekeurde job terug in
+        # de wachtrij; bij een echte stroomuitval doet weesherstel dit na boot.
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        database.execute(
+            """
+            UPDATE job SET status='wacht',fout=?,foutsoort=NULL,proces_pid=NULL,
+                           worker_id=NULL,cache_reservering=0,percent=0,klaar_op=NULL
+            WHERE id=?
+            """,
+            (str(exc), job_id),
+        )
+        _finish_attempt(
+            database,
+            job_id,
+            "afgebroken",
+            error=str(exc),
+            error_type="ServiceStop",
+        )
+        return False
+    except FileNotFoundError as exc:
+        # Een scanner kan een inmiddels door Radarr/Sonarr verplaatst bestand
+        # nog als job hebben. Dat is geen encodefout en mag geen automatische
+        # retry-lus veroorzaken; de volgende scan maakt de catalogus recht.
+        message = f"bron niet meer aanwezig; volgende scan controleert opnieuw: {exc}"
+        database.execute(
+            """
+            UPDATE job SET status='overgeslagen',fout=?,foutsoort='BronNietBeschikbaar',
+                           klaar_op=?,proces_pid=NULL,cache_reservering=0
+            WHERE id=?
+            """,
+            (message[:1000], datetime.now(UTC).isoformat(), job_id),
+        )
+        _finish_attempt(
+            database,
+            job_id,
+            "overgeslagen",
+            error=message,
+            error_type="BronNietBeschikbaar",
+        )
+        return False
     except (ExecutionError, MetadataError, ReplacementError, OSError, ValueError) as exc:
         record_failure(database, job_id, str(exc), type(exc).__name__)
         return False

@@ -55,6 +55,7 @@ from app.lan import (
     validate_username,
 )
 from app.media.beslissen import STANDAARD, Besluit, beslis
+from app.metingen import system_metric_history
 from app.opslag import (
     StorageChangeError,
     build_storage_candidate,
@@ -68,6 +69,7 @@ from app.scanner import ScanError, scan_library
 from app.scanscheduler import LibraryScanScheduler, record_scan_failure
 from app.systeem import GpuMonitor, mount_report, qsv_test, system_metrics
 from app.uitvoerder import ExecutionError, create_job_from_decision
+from app.vervanging import temporary_replacement_path
 from app.wachtrijherstel import (
     QueueRecoveryError,
     media_process_alive,
@@ -257,6 +259,7 @@ class AiConfigPatch(StrictModel):
     api_sleutel: str | None = Field(default=None, min_length=20, max_length=500)
     verwijder_sleutel: bool = False
     hdr10_vrijgegeven: bool = False
+    geheugenherstel_ingeschakeld: bool = True
     bevestiging: str | None = None
     hdr10_bevestiging: str | None = None
 
@@ -366,6 +369,26 @@ def _profile_settings(value: dict[str, Any]) -> dict[str, Any]:
         merged["ondertitel_talen"], list
     ):
         raise HTTPException(422, "taalvoorkeuren moeten lijsten zijn")
+    for key in (
+        "doel_bitrate_2160_kbps",
+        "doel_bitrate_1080_kbps",
+        "doel_bitrate_720_kbps",
+    ):
+        try:
+            bitrate = int(merged[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(422, f"{key} moet een geheel getal zijn") from exc
+        if bitrate < 0 or bitrate > 200_000:
+            raise HTTPException(422, f"{key} moet tussen 0 en 200000 kbps liggen")
+        merged[key] = bitrate
+    for key in ("svt_threads_2160", "svt_threads_1080", "svt_threads_720"):
+        try:
+            threads = int(merged[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(422, f"{key} moet een geheel getal zijn") from exc
+        if threads < 0 or threads > 128:
+            raise HTTPException(422, f"{key} moet 0 (automatisch) of maximaal 128 zijn")
+        merged[key] = threads
     return merged
 
 
@@ -530,9 +553,11 @@ def _worker_rows(database: Database) -> list[dict[str, Any]]:
         item["geheugen_totaal_bytes"] = int(memory.total)
         item["geheugen_beschikbaar_bytes"] = int(memory.available)
         item["veiligheidsuitleg"] = (
-            f"De totale encodegrens staat op {total_limit}. Op deze 15-GiB-host is 1 "
-            "aanbevolen. Na een RAM-upgrade kun je de grens en worker-aantallen verhogen. "
-            "Een mislukte job krijgt maximaal één automatische herstelpoging."
+            f"De totale encodegrens staat op {total_limit}. Deze host heeft "
+            f"{memory.total / 1024**3:.1f} GiB RAM; SVT-4K kiest automatisch een "
+            "veilige paralleliteit uit beschikbaar geheugen. Na een RAM-upgrade "
+            "kan de totale grens worden verhoogd. Een mislukte job krijgt maximaal "
+            "één automatische herstelpoging."
         )
         active = database.fetch_all(
             """
@@ -1073,7 +1098,13 @@ def create_api_router() -> APIRouter:
     @router.get("/profielen")
     async def profiles(request: Request) -> list[dict[str, Any]]:
         return [
-            {"id": row["id"], "naam": row["naam"], "instellingen": _json_object(row["inst"])}
+            {
+                "id": row["id"],
+                "naam": row["naam"],
+                # Voeg nieuwe veilige profielvelden ook aan oude profielen toe,
+                # zodat de bitrate- en geheugenkeuzes direct zichtbaar zijn.
+                "instellingen": _profile_settings(_json_object(row["inst"])),
+            }
             for row in _database(request).fetch_all("SELECT * FROM profiel ORDER BY naam")
         ]
 
@@ -1340,6 +1371,12 @@ def create_api_router() -> APIRouter:
         probe = _json_object(str(row["probe"] or "{}"))
         if probe.get("hdr10plus"):
             raise HTTPException(409, "HDR10+ kan nooit geforceerd worden")
+        if int(probe.get("dv_profile") or 0) and body.encoder == "av1_qsv":
+            raise HTTPException(
+                409,
+                "Dolby Vision blijft CPU-only: av1_qsv kan de RPU niet dragen; "
+                "metadata terugmuxen is geen geldige DV-vervanging",
+            )
         hardlink = int(row["nlink"]) > 1
         if hardlink:
             feature = database.fetch_one(
@@ -1783,6 +1820,17 @@ def create_api_router() -> APIRouter:
         if row is None:
             raise HTTPException(500, "AI-controllerconfiguratie ontbreekt")
         configuration = _json_object(str(row["configuratie"]))
+        dv_feature = database.fetch_one(
+            "SELECT ingeschakeld,configuratie FROM functie WHERE sleutel='dv_experimenteel'"
+        )
+        dv_configuration = (
+            _json_object(str(dv_feature["configuratie"])) if dv_feature is not None else {}
+        )
+        dv_released = bool(
+            dv_feature
+            and dv_feature["ingeschakeld"]
+            and dv_configuration.get("tv_test_geslaagd", False)
+        )
         month = datetime.now(UTC).strftime("%Y-%m")
         usage = database.fetch_one(
             """
@@ -1798,10 +1846,14 @@ def create_api_router() -> APIRouter:
             "ingeschakeld": bool(row["ingeschakeld"]),
             "modus": str(configuration.get("modus", "schaduw")),
             "provider": "openai",
-            "model": str(configuration.get("model", "gpt-5.6-luna")),
+            "model": str(configuration.get("model", "gpt-6-luna")),
             "reasoning": str(configuration.get("reasoning", "medium")),
             "maandbudget_usd": float(configuration.get("maandbudget_usd", 10)),
             "hdr10_vrijgegeven": bool(configuration.get("hdr10_vrijgegeven", False)),
+            "dv_vrijgegeven": dv_released,
+            "geheugenherstel_ingeschakeld": bool(
+                configuration.get("geheugenherstel_ingeschakeld", True)
+            ),
             "api_sleutel_ingesteld": SecretStore(
                 database, _settings(request)
             ).configured(AI_SECRET_KEY),
@@ -1820,11 +1872,23 @@ def create_api_router() -> APIRouter:
             "bevoegdheden": [
                 "deterministisch veilig overslaan",
                 "waarschuwingvrije SDR-hercodering en -opschoning",
+                *(
+                    ["TV-geteste Dolby Vision-profielen 7 en 8 via de CPU"]
+                    if dv_released
+                    else []
+                ),
                 "maximaal één automatische herstelpoging per mislukte job",
+                "joblokale geheugenveilige CPU- of GPU-instelling bij een encoderfout",
+                "joblokale lagere doelbitrate als verificatie een groter resultaat meet",
             ],
             "altijd_handmatig": [
-                "opruimen, hardlinks, HDR10+, Dolby Vision en canary-vrijgave",
-                "encoderwissels en iedere fout die na de eerste herstelpoging terugkomt",
+                (
+                    "opruimen, hardlinks, HDR10+, Dolby Vision profiel 5 en canary-vrijgave"
+                    if dv_released
+                    else "opruimen, hardlinks, HDR10+, Dolby Vision en canary-vrijgave"
+                ),
+                "encoder- en baanwissels en iedere fout na de eerste herstelpoging",
+                "alle overige bitrate-, CRF-, HDR- of Dolby-Visionwijzigingen",
                 "verificatie-, metadata-, ACL/xattr-, mount- en herstelconflicten",
             ],
         }
@@ -1872,11 +1936,12 @@ def create_api_router() -> APIRouter:
             **old_configuration,
             "modus": body.modus,
             "provider": "openai",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
             "reasoning": "medium",
             "maandbudget_usd": body.maandbudget_usd,
             "hdr10_vrijgegeven": body.hdr10_vrijgegeven,
-            "prompt_versie": str(old_configuration.get("prompt_versie", "1")),
+            "geheugenherstel_ingeschakeld": body.geheugenherstel_ingeschakeld,
+            "prompt_versie": "2",
         }
         now = datetime.now(UTC).isoformat()
         database.execute(
@@ -1910,6 +1975,7 @@ def create_api_router() -> APIRouter:
                         "ingeschakeld": body.ingeschakeld,
                         "modus": body.modus,
                         "hdr10_vrijgegeven": body.hdr10_vrijgegeven,
+                        "geheugenherstel_ingeschakeld": body.geheugenherstel_ingeschakeld,
                         "tv_test_bewust_overgeslagen": body.hdr10_vrijgegeven,
                     },
                     ensure_ascii=False,
@@ -1947,6 +2013,7 @@ def create_api_router() -> APIRouter:
             item["redencodes"] = proposal.get("redencodes", [])
             item["bewijsvelden"] = proposal.get("bewijsvelden", [])
             item["vertrouwen"] = proposal.get("vertrouwen")
+            item["retry_aanpassing"] = proposal.get("retry_aanpassing", "geen")
             item["kosten_usd"] = round(int(item["kosten_microdollar"]) / 1_000_000, 6)
             # De ruwe JSON bevat geen extra informatie meer en hoeft niet naar de browser.
             item.pop("voorstel", None)
@@ -2197,8 +2264,23 @@ def create_api_router() -> APIRouter:
             "canary_limiet": (False, "CANARY-LIMIET UITZETTEN"),
         }
         risky = confirmations.get(key)
-        if risky is not None and body.ingeschakeld == risky[0] and body.bevestiging != risky[1]:
+        if (
+            risky is not None
+            and body.ingeschakeld == risky[0]
+            and bool(row["ingeschakeld"]) != body.ingeschakeld
+            and body.bevestiging != risky[1]
+        ):
             raise HTTPException(409, f"Typ ter bevestiging exact: {risky[1]}")
+        old_configuration = _json_object(str(row["configuratie"]))
+        if (
+            key == "dv_experimenteel"
+            and body.configuratie.get("tv_test_geslaagd") is True
+            and old_configuration.get("tv_test_geslaagd") is not True
+            and body.bevestiging != "DOLBY VISION TV-TEST GESLAAGD"
+        ):
+            raise HTTPException(
+                409, "Typ ter bevestiging exact: DOLBY VISION TV-TEST GESLAAGD"
+            )
         database.execute(
             "UPDATE functie SET ingeschakeld=?,configuratie=?,gewijzigd_op=? WHERE sleutel=?",
             (
@@ -2297,6 +2379,15 @@ def create_api_router() -> APIRouter:
             "mounts": mount_report(_settings(request)),
         }
 
+    @router.get("/systeem/metingen")
+    async def system_measurements(
+        request: Request,
+        uren: int = Query(default=1, ge=1, le=24 * 7),
+    ) -> list[dict[str, Any]]:
+        """Historische meetpunten voor het dashboard; live ticks blijven via WS."""
+
+        return system_metric_history(_database(request), uren)
+
     @router.get("/systeem/mounts")
     async def mounts(request: Request) -> dict[str, Any]:
         return mount_report(_settings(request))
@@ -2380,8 +2471,12 @@ def create_api_router() -> APIRouter:
             raise HTTPException(409, "Alleen een conflicterend tijdelijk resultaat is opruimbaar")
         source = Path(str(row["bron_pad"])).resolve()
         temporary = Path(str(row["tijdelijk_pad"])).resolve()
-        expected = source.with_name(f".{source.name}.av1-pipeline-{int(row['job_id'])}.deel")
-        if temporary != expected or temporary.parent != source.parent:
+        expected = temporary_replacement_path(source, int(row["job_id"]))
+        # Bestaande transacties van vóór de korte-naamreparatie blijven via de
+        # UI veilig opruimbaar; nieuwe transacties gebruiken uitsluitend de
+        # gehashte korte naam.
+        legacy = source.with_name(f".{source.name}.av1-pipeline-{int(row['job_id'])}.deel")
+        if temporary not in {expected, legacy} or temporary.parent != source.parent:
             raise HTTPException(409, "Tijdelijk pad voldoet niet aan het vervangprotocol")
         if not source.is_file():
             raise HTTPException(

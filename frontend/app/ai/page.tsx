@@ -228,6 +228,7 @@ export default function AiPage() {
               {analysis.fout ? <p className="danger">{analysis.fout}</p> : null}
               <dl className="ai-decision-details">
                 <div><dt>Voorstel</dt><dd>{analysis.voorgestelde_actie ?? "geen geldig voorstel"}</dd></div>
+                <div><dt>Jobaanpassing</dt><dd>{analysis.retry_aanpassing.replaceAll("_", " ")}</dd></div>
                 <div><dt>Lokale policy</dt><dd>{analysis.policy_uitkomst ?? "geen actie"}</dd></div>
                 <div><dt>Redencodes</dt><dd>{analysis.redencodes.length ? analysis.redencodes.join(", ") : "—"}</dd></div>
                 <div><dt>Bewijsvelden</dt><dd>{analysis.bewijsvelden.length ? analysis.bewijsvelden.join(", ") : "—"}</dd></div>

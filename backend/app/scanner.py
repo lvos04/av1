@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -26,6 +27,7 @@ class ScanError(RuntimeError):
 
 SCAN_LOCK = threading.Lock()
 FILE_STABILITY_SECONDS = 3600
+LOGGER = logging.getLogger(__name__)
 
 
 def _decision_code_fingerprint() -> str:
@@ -84,6 +86,55 @@ def _library(database: Database, library_id: int) -> tuple[Any, dict[str, Any]]:
     return row, profile_value
 
 
+def _profile_fingerprint(profile: dict[str, Any]) -> str:
+    """Koppel een besluit aan zowel de actuele instellingen als de besliscode."""
+
+    return hashlib.sha256(
+        json.dumps(
+            {"profiel": profile, "besliscode": DECISION_CODE_FINGERPRINT},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _profile_from_connection(connection: Any, library_id: int) -> dict[str, Any]:
+    row = connection.execute(
+        """
+        SELECT p.inst
+        FROM library l JOIN profiel p ON p.id=l.profiel_id
+        WHERE l.id=? AND l.actief=1
+        """,
+        (library_id,),
+    ).fetchone()
+    if row is None:
+        raise ScanError(f"Actieve library {library_id} bestaat niet")
+    value = json.loads(str(row["inst"]))
+    if not isinstance(value, dict):
+        raise ScanError("Profielinstellingen moeten een JSON-object zijn")
+    return value
+
+
+def _reset_scan_pass(
+    database: Database,
+    scan_id: int | None,
+    library_id: int,
+    *,
+    dry_run: bool,
+) -> None:
+    """Wis alleen de voortgang; eerdere besluiten worden bij herbeoordeling vervangen."""
+
+    if dry_run or scan_id is None:
+        return
+    with database.connection() as connection:
+        connection.execute(
+            "UPDATE scan_run SET cursor=NULL,gevonden=0 WHERE id=?", (scan_id,)
+        )
+        connection.execute("UPDATE library SET scan_cursor=NULL WHERE id=?", (library_id,))
+        connection.commit()
+
+
 def _directories(root: Path) -> list[Path]:
     directories: list[Path] = []
     for current, names, _files in os.walk(root):
@@ -124,14 +175,7 @@ def _scan_library_locked(
     """Voer één procesbrede scan uit; SQLite bewaakt daarnaast de libraryclaim."""
 
     library, profile = _library(database, library_id)
-    profile_fingerprint = hashlib.sha256(
-        json.dumps(
-            {"profiel": profile, "besliscode": DECISION_CODE_FINGERPRINT},
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    profile_fingerprint = _profile_fingerprint(profile)
     root = Path(str(library["pad"]))
     if not root.is_dir():
         raise ScanError(f"Librarypad bestaat niet of is geen map: {root}")
@@ -178,43 +222,129 @@ def _scan_library_locked(
             (library_id,),
         )
 
+        # Een afgebroken scan kan vóór een profielwijziging zijn begonnen. In
+        # dat geval is de opgeslagen cursor niet meer geldig: ook de mappen vóór
+        # die cursor moeten opnieuw door de beslisboom met het nieuwste profiel.
+        stale_pass = database.fetch_one(
+            """
+            SELECT 1 FROM bestand
+            WHERE library_id=? AND gescand_op=?
+              AND COALESCE(profiel_fingerprint, '')<>?
+            LIMIT 1
+            """,
+            (library_id, started_at, profile_fingerprint),
+        )
+        if stale_pass is not None:
+            cursor_path = ""
+            _reset_scan_pass(database, scan_id, library_id, dry_run=dry_run)
+
     processed_directories = 0
-    for directory in _directories(root):
-        directory_text = str(directory)
-        if cursor_path and directory_text <= cursor_path:
-            continue
-        entries = sorted(directory.iterdir(), key=lambda path: path.name.casefold())
-        with database.connection() as connection:
-            for path in entries:
-                if not path.is_file() or path.suffix.lower() not in VIDEO_EXT:
-                    continue
-                stat = path.stat()
-                _process_file(
-                    connection,
+    while True:
+        restart_with_new_profile = False
+        for directory in _directories(root):
+            directory_text = str(directory)
+            if cursor_path and directory_text <= cursor_path:
+                continue
+
+            # Een profiel kan via de UI worden aangepast terwijl een grote scan
+            # uren loopt. Controleer vóór iedere map; een wijziging maakt de
+            # volledige voortgang van deze scan ongeldig.
+            _library_row, latest_profile = _library(database, library_id)
+            latest_fingerprint = _profile_fingerprint(latest_profile)
+            if latest_fingerprint != profile_fingerprint:
+                profile = latest_profile
+                profile_fingerprint = latest_fingerprint
+                cursor_path = ""
+                summary = ScanSummary(
+                    library_id=library_id,
+                    dry_run=dry_run,
+                    hervat=summary.hervat,
+                )
+                _reset_scan_pass(database, scan_id, library_id, dry_run=dry_run)
+                LOGGER.info(
+                    "Profiel van library %s wijzigde tijdens de scan; herstart vanaf het begin",
                     library_id,
-                    path,
-                    stat,
-                    profile,
-                    profile_fingerprint,
-                    started_at,
-                    dry_run,
-                    summary,
                 )
-            if not dry_run and scan_id is not None:
-                connection.execute(
-                    "UPDATE scan_run SET cursor=?, gevonden=? WHERE id=?",
-                    (directory_text, summary.gevonden, scan_id),
+                restart_with_new_profile = True
+                break
+
+            entries = sorted(directory.iterdir(), key=lambda path: path.name.casefold())
+            with database.connection() as connection:
+                for path in entries:
+                    if not path.is_file() or path.suffix.lower() not in VIDEO_EXT:
+                        continue
+                    stat = path.stat()
+                    _process_file(
+                        connection,
+                        library_id,
+                        path,
+                        stat,
+                        profile,
+                        profile_fingerprint,
+                        started_at,
+                        dry_run,
+                        summary,
+                    )
+                if not dry_run and scan_id is not None:
+                    connection.execute(
+                        "UPDATE scan_run SET cursor=?, gevonden=? WHERE id=?",
+                        (directory_text, summary.gevonden, scan_id),
+                    )
+                    connection.execute(
+                        "UPDATE library SET scan_cursor=? WHERE id=?",
+                        (directory_text, library_id),
+                    )
+                    connection.commit()
+            processed_directories += 1
+            if (
+                stop_after_directories is not None
+                and processed_directories >= stop_after_directories
+            ):
+                return summary
+
+        if restart_with_new_profile:
+            continue
+
+        if dry_run:
+            _library_row, latest_profile = _library(database, library_id)
+            latest_fingerprint = _profile_fingerprint(latest_profile)
+            if latest_fingerprint != profile_fingerprint:
+                profile = latest_profile
+                profile_fingerprint = latest_fingerprint
+                cursor_path = ""
+                summary = ScanSummary(
+                    library_id=library_id,
+                    dry_run=True,
+                    hervat=summary.hervat,
                 )
-                connection.execute(
-                    "UPDATE library SET scan_cursor=? WHERE id=?", (directory_text, library_id)
-                )
-                connection.commit()
-        processed_directories += 1
-        if stop_after_directories is not None and processed_directories >= stop_after_directories:
+                continue
             return summary
 
-    if not dry_run and scan_id is not None:
+        if scan_id is None:
+            return summary
+
         with database.connection() as connection:
+            # BEGIN IMMEDIATE sluit het laatste kleine racevenster: een profiel-
+            # wijziging kan niet tegelijk met het definitief afronden committen.
+            connection.execute("BEGIN IMMEDIATE")
+            latest_profile = _profile_from_connection(connection, library_id)
+            latest_fingerprint = _profile_fingerprint(latest_profile)
+            if latest_fingerprint != profile_fingerprint:
+                connection.rollback()
+                profile = latest_profile
+                profile_fingerprint = latest_fingerprint
+                cursor_path = ""
+                summary = ScanSummary(
+                    library_id=library_id,
+                    dry_run=False,
+                    hervat=summary.hervat,
+                )
+                _reset_scan_pass(database, scan_id, library_id, dry_run=False)
+                LOGGER.info(
+                    "Profiel van library %s wijzigde bij afronding; herstart vanaf het begin",
+                    library_id,
+                )
+                continue
             cursor = connection.execute(
                 """
                 UPDATE bestand
@@ -262,7 +392,7 @@ def _scan_library_locked(
                 (now, library_id),
             )
             connection.commit()
-    return summary
+        return summary
 
 
 def _process_file(

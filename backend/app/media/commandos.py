@@ -21,6 +21,8 @@ breken je .nfo-bestanden, je externe .srt en je Radarr-koppeling.
 import os
 from typing import Any
 
+import psutil
+
 from app.media.beslissen import Besluit
 
 # Ondertitelformaten die Matroska aankan. Alles daarbuiten (mov_text uit MP4)
@@ -85,6 +87,80 @@ def _sub_codecs(besluit: Besluit, info: dict[str, Any]) -> list[str]:
     return args
 
 
+def _mkvmerge_track_selection(besluit: Besluit) -> list[str]:
+    """Selecteer exact dezelfde Matroska-sporen als de FFmpeg-route."""
+
+    args = ["--video-tracks", "0"]
+    if besluit.audio_houden:
+        args += ["--audio-tracks", ",".join(str(item) for item in besluit.audio_houden)]
+    else:
+        args += ["--no-audio"]
+    if besluit.subs_houden:
+        args += ["--subtitle-tracks", ",".join(str(item) for item in besluit.subs_houden)]
+    else:
+        args += ["--no-subtitles"]
+    if not besluit.attachments_houden:
+        args += ["--no-attachments"]
+    return args
+
+
+def _can_mkvmerge_cleanup(info: dict[str, Any], besluit: Besluit) -> bool:
+    """Gebruik mkvmerge alleen als geen ondertitelconversie nodig is."""
+
+    if "matroska" not in str(info.get("container") or "").lower():
+        return False
+    subtitles = {int(item["index"]): str(item.get("codec") or "") for item in info["subs"]}
+    return all(subtitles.get(index, "") in MKV_SUB_CODECS for index in besluit.subs_houden)
+
+
+def _doel_bitrate(inst: dict[str, Any], klasse: str) -> int:
+    """Lees een doelbitrate veilig; nul betekent de bestaande CRF-modus."""
+
+    raw = inst.get(f"doel_bitrate_{klasse}_kbps", 0)
+    try:
+        value = int(raw or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return max(0, min(value, 200_000))
+
+
+def _svt_paralleliteit(hoogte: int, inst: dict[str, Any]) -> int:
+    """Kies SVT-workers op basis van RAM zonder een 4K-host te laten OOM'en.
+
+    Een 4K-SVT-worker kan naast de framebuffers en muxing grofweg 1,5 GiB
+    gebruiken. We reserveren daarom 50% van het totale RAM voor Ubuntu,
+    SQLite, de GPU-driver en muxing en houden daarnaast 2 GiB van het op dit
+    moment beschikbare geheugen vrij. Meer-RAM-machines krijgen daardoor
+    automatisch meer paralleliteit, terwijl een drukke host terugschakelt.
+    """
+
+    klasse = "2160" if hoogte > 1200 else "1080" if hoogte > 800 else "720"
+    try:
+        requested = int(inst.get(f"svt_threads_{klasse}", 0) or 0)
+    except (TypeError, ValueError):
+        requested = 0
+    cpu_count = max(1, os.cpu_count() or 1)
+    memory = psutil.virtual_memory()
+    gib = 1024**3
+    per_worker = {"2160": 1.5, "1080": 0.75, "720": 0.4}[klasse] * gib
+    budget = min(memory.total * 0.50, max(1 * gib, memory.available - 2 * gib))
+    automatic = max(1, min(cpu_count, int(budget / per_worker)))
+    if requested > 0:
+        return max(1, min(requested, automatic, cpu_count))
+    return automatic
+
+
+def _rate_or_quality(inst: dict[str, Any], klasse: str, crf: int) -> list[str]:
+    target = _doel_bitrate(inst, klasse)
+    if target <= 0:
+        return ["-crf", str(crf)]
+    # SVT-AV1 2.x accepteert maxrate alleen in CRF-modus. In combinatie met
+    # een gemiddelde doelbitrate weigert de encoder al vóór het eerste frame
+    # met "Max Bitrate only supported with CRF mode". De QSV-route heeft haar
+    # eigen VBV-instellingen; voor SVT gebruiken we daarom zuivere ABR.
+    return ["-b:v", f"{target}k"]
+
+
 def opschonen(info: dict[str, Any], besluit: Besluit, bron: str, doel: str) -> list[str]:
     """Alleen sporen uitdunnen en remuxen naar MKV. Raakt de video niet aan.
 
@@ -92,6 +168,18 @@ def opschonen(info: dict[str, Any], besluit: Besluit, bron: str, doel: str) -> l
     TrueHD Atmos, DTS-HD MA en een commentaarspoor draagt makkelijk 15 tot
     20 GB aan audio mee. Kost minuten per bestand, geen kwaliteitsverlies.
     """
+    if _can_mkvmerge_cleanup(info, besluit):
+        # FFmpeg weigert sommige oudere, verder afspeelbare HEVC-bitstreams
+        # wegens een ongeldige default-display-window al tijdens het schrijven
+        # van de MKV-header. mkvmerge kopieert zulke Matroska-sporen veilig
+        # zonder de videobitstream of metadata te herschrijven.
+        return [
+            "mkvmerge",
+            "--output",
+            doel,
+            *_mkvmerge_track_selection(besluit),
+            bron,
+        ]
     return (
         _basis(bron)
         + _maps(besluit)
@@ -109,11 +197,12 @@ def encode_cpu(
     doel: str,
 ) -> list[str]:
     """SVT-AV1 op de CPU. De enige route die HDR10 correct meedraagt."""
-    kl = "2160" if info["height"] > 1200 else "1080"
+    kl = "2160" if info["height"] > 1200 else "1080" if info["height"] > 800 else "720"
     crf = inst["crf_" + kl]
     preset = inst["preset_" + kl]
+    parallel = _svt_paralleliteit(info["height"], inst)
 
-    params = ["film-grain={}".format(inst["film_grain"])]
+    params = ["film-grain={}".format(inst["film_grain"]), f"lp={parallel}"]
     kleur = []
     dv = []
     if getattr(besluit, "dolby_vision", False):
@@ -141,8 +230,9 @@ def encode_cpu(
         + [
             "-c:v",
             "libsvtav1",
-            "-crf",
-            str(crf),
+            *_rate_or_quality(inst, kl, crf),
+            "-threads",
+            str(parallel),
             "-preset",
             str(preset),
             "-pix_fmt",
@@ -169,6 +259,29 @@ def encode_gpu(
     p010le, niet yuv420p10le: QSV wil zijn eigen 10-bits formaat. Geef je het
     verkeerde mee, dan valt ffmpeg terug op 8-bit of faalt de encode.
     """
+    if besluit.dolby_vision:
+        raise ValueError(
+            "Dolby Vision mag niet via av1_qsv: deze encoder kan de RPU niet behouden"
+        )
+    klasse = "2160" if info["height"] > 1200 else "1080" if info["height"] > 800 else "720"
+    rate = _doel_bitrate(inst, klasse)
+    try:
+        extra_hw_frames = int(inst.get("gpu_extra_hw_frames", 64) or 64)
+    except (TypeError, ValueError):
+        extra_hw_frames = 64
+    extra_hw_frames = max(8, min(extra_hw_frames, 64))
+    rate_args = (
+        [
+            "-b:v",
+            f"{rate}k",
+            "-maxrate",
+            f"{rate * 3 // 2}k",
+            "-bufsize",
+            f"{rate * 2}k",
+        ]
+        if rate > 0
+        else ["-global_quality", str(inst["gpu_quality"])]
+    )
     return (
         [
             "ffmpeg",
@@ -192,11 +305,10 @@ def encode_gpu(
         + [  # Expliciet uploaden naar de GPU. Zonder deze filter valt
             # ffmpeg bij sommige bronformaten terug op software.
             "-vf",
-            "format=p010le,hwupload=extra_hw_frames=64",
+            f"format=p010le,hwupload=extra_hw_frames={extra_hw_frames}",
             "-c:v",
             "av1_qsv",
-            "-global_quality",
-            str(inst["gpu_quality"]),
+            *rate_args,
             "-preset",
             "veryslow",
             "-map_chapters",

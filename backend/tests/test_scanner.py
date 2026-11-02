@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from conftest import TESTDATA
 
+from app import scanner as scanner_module
 from app.config import settings
 from app.db import Database
 from app.media.beslissen import STANDAARD
@@ -97,6 +98,48 @@ def test_afgebroken_scan_wordt_hervat(tmp_path: Path) -> None:
     assert resumed.hervat is True
     assert database.fetch_one("SELECT COUNT(*) FROM bestand")[0] == 6
     assert database.fetch_one("SELECT status FROM scan_run ORDER BY id DESC")[0] == "klaar"
+
+
+def test_profielwijziging_tijdens_scan_herstart_met_nieuwste_instellingen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _database(tmp_path)
+    original_process_file = scanner_module._process_file
+    changed = False
+
+    def change_profile_after_first_file(*args: object, **kwargs: object) -> None:
+        nonlocal changed
+        original_process_file(*args, **kwargs)
+        if changed:
+            return
+        connection = args[0]
+        row = connection.execute("SELECT inst FROM profiel WHERE id=1").fetchone()
+        values = json.loads(str(row["inst"]))
+        values["drempel_1080"] = 999_999
+        connection.execute(
+            "UPDATE profiel SET inst=? WHERE id=1",
+            (json.dumps(values, ensure_ascii=False),),
+        )
+        changed = True
+
+    monkeypatch.setattr(scanner_module, "_process_file", change_profile_after_first_file)
+
+    result = scan_library(database, 1)
+
+    assert changed is True
+    assert result.gevonden == 6
+    assert database.fetch_one(
+        "SELECT COUNT(DISTINCT profiel_fingerprint) FROM bestand"
+    )[0] == 1
+    latest = database.fetch_one(
+        """
+        SELECT d.reden
+        FROM besluit d JOIN bestand b ON b.id=d.bestand_id
+        WHERE b.pad LIKE '%1080p%' AND d.status='nieuw'
+        ORDER BY d.id DESC LIMIT 1
+        """
+    )
+    assert latest is not None and "drempel 999999" in str(latest["reden"])
 
 
 def test_ongewijzigde_media_wordt_niet_opnieuw_geprobed(

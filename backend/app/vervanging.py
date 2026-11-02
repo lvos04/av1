@@ -37,10 +37,60 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def temporary_replacement_path(source: Path, job_id: int) -> Path:
+    """Maak een korte, unieke verborgen naam op hetzelfde filesystem.
+
+    De bronnaam zelf opnemen is onveilig: een geldige Matroska-naam kan al
+    bijna NAME_MAX bytes lang zijn, waarna onze transactiesuffix een
+    ``ENAMETOOLONG`` veroorzaakt nadat de volledige encode al klaar is.
+    """
+
+    digest = hashlib.sha256(os.fsencode(source.name)).hexdigest()[:12]
+    return source.with_name(f".av1-pipeline-{job_id}-{digest}.deel")
+
+
 def _set_status(database: Database, transaction_id: int, status: str, note: str = "") -> None:
     database.execute(
         "UPDATE vervang_transactie SET status=?,gewijzigd_op=?,toelichting=? WHERE id=?",
         (status, datetime.now(UTC).isoformat(), note or None, transaction_id),
+    )
+
+
+def _resume_recovered_job(database: Database, job_id: int) -> None:
+    """Hervat alleen als niet al een nieuwere actieve job hetzelfde bestand bezit."""
+
+    database.execute(
+        """
+        UPDATE job AS herstel
+        SET status=CASE WHEN EXISTS (
+                SELECT 1 FROM job AS actief
+                WHERE actief.bestand_id=herstel.bestand_id
+                  AND actief.id<>herstel.id
+                  AND actief.status IN ('wacht','bezig','verifieren')
+            ) THEN 'overgeslagen' ELSE 'wacht' END,
+            worker_id=NULL,proces_pid=NULL,cache_reservering=0,percent=0,
+            fout=CASE WHEN EXISTS (
+                SELECT 1 FROM job AS actief
+                WHERE actief.bestand_id=herstel.bestand_id
+                  AND actief.id<>herstel.id
+                  AND actief.status IN ('wacht','bezig','verifieren')
+            ) THEN 'herstelde oude job overgeslagen; nieuwere actieve job blijft eigenaar'
+              ELSE 'vervanging na herstart hervatbaar' END,
+            foutsoort=CASE WHEN EXISTS (
+                SELECT 1 FROM job AS actief
+                WHERE actief.bestand_id=herstel.bestand_id
+                  AND actief.id<>herstel.id
+                  AND actief.status IN ('wacht','bezig','verifieren')
+            ) THEN 'DuplicateJob' ELSE NULL END,
+            klaar_op=CASE WHEN EXISTS (
+                SELECT 1 FROM job AS actief
+                WHERE actief.bestand_id=herstel.bestand_id
+                  AND actief.id<>herstel.id
+                  AND actief.status IN ('wacht','bezig','verifieren')
+            ) THEN CURRENT_TIMESTAMP ELSE NULL END
+        WHERE herstel.id=?
+        """,
+        (job_id,),
     )
 
 
@@ -54,29 +104,61 @@ def atomic_replace(
     after_step: Callable[[str], None] | None = None,
 ) -> None:
     source_stat = source.stat()
-    temporary = source.with_name(f".{source.name}.av1-pipeline-{job_id}.deel")
+    temporary = temporary_replacement_path(source, job_id)
     result_hash = file_sha256(verified_result)
     now = datetime.now(UTC).isoformat()
-    transaction_id = database.execute_insert(
-        """
-        INSERT INTO vervang_transactie(
-            job_id,status,bron_pad,tijdelijk_pad,bron_device,bron_inode,
-            bron_grootte,bron_mtime,resultaat_sha256,gemaakt_op,gewijzigd_op
-        ) VALUES (?, 'gestart', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            job_id,
-            str(source),
-            str(temporary),
-            source_stat.st_dev,
-            source_stat.st_ino,
-            source_stat.st_size,
-            source_stat.st_mtime,
-            result_hash,
-            now,
-            now,
-        ),
+    existing = database.fetch_one(
+        "SELECT id,status FROM vervang_transactie WHERE job_id=?", (job_id,)
     )
+    if existing is None:
+        transaction_id = database.execute_insert(
+            """
+            INSERT INTO vervang_transactie(
+                job_id,status,bron_pad,tijdelijk_pad,bron_device,bron_inode,
+                bron_grootte,bron_mtime,resultaat_sha256,gemaakt_op,gewijzigd_op
+            ) VALUES (?, 'gestart', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                str(source),
+                str(temporary),
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_size,
+                source_stat.st_mtime,
+                result_hash,
+                now,
+                now,
+            ),
+        )
+    else:
+        if str(existing["status"]) not in {"hersteld", "opgeruimd"}:
+            raise ReplacementError(
+                "er staat al een niet-afgesloten vervangtransactie voor deze job; "
+                "controleer Hersteltransacties in Instellingen"
+            )
+        transaction_id = int(existing["id"])
+        database.execute(
+            """
+            UPDATE vervang_transactie
+            SET status='gestart',bron_pad=?,tijdelijk_pad=?,bron_device=?,bron_inode=?,
+                bron_grootte=?,bron_mtime=?,resultaat_sha256=?,gemaakt_op=?,gewijzigd_op=?,
+                toelichting=NULL
+            WHERE id=?
+            """,
+            (
+                str(source),
+                str(temporary),
+                source_stat.st_dev,
+                source_stat.st_ino,
+                source_stat.st_size,
+                source_stat.st_mtime,
+                result_hash,
+                now,
+                now,
+                transaction_id,
+            ),
+        )
     if after_step is not None:
         after_step("gestart")
     try:
@@ -248,15 +330,7 @@ def recover_replacements(
                 continue
         if source_unchanged and (temporary is None or not temporary.exists()):
             _set_status(database, transaction_id, "hersteld", "bron stond intact op zijn pad")
-            database.execute(
-                """
-                UPDATE job SET status='wacht',worker_id=NULL,proces_pid=NULL,
-                               cache_reservering=0,percent=0,
-                               fout='vervanging na herstart hervatbaar'
-                WHERE id=?
-                """,
-                (int(row["job_id"]),),
-            )
+            _resume_recovered_job(database, int(row["job_id"]))
             if settings is not None:
                 shutil.rmtree(settings.cache_root / str(row["job_id"]), ignore_errors=True)
             outcomes.append({"pad": str(source), "status": "hersteld"})
@@ -272,10 +346,7 @@ def recover_replacements(
             temporary.unlink()
             _fsync_directory(source.parent)
             _set_status(database, transaction_id, "hersteld", "onbewezen deelkopie verwijderd")
-            database.execute(
-                "UPDATE job SET status='wacht',proces_pid=NULL,cache_reservering=0 WHERE id=?",
-                (int(row["job_id"]),),
-            )
+            _resume_recovered_job(database, int(row["job_id"]))
             outcomes.append({"pad": str(source), "status": "hersteld"})
             continue
         _set_status(database, transaction_id, "conflict", "toestand niet ondubbelzinnig")

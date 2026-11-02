@@ -351,7 +351,7 @@ def test_ai_statistieken_aggregeren_lokale_dagen_en_voorstelvelden(
                 soort,fingerprint,provider,model,prompt_versie,modus,invoer_hash,
                 classificatie,voorgestelde_actie,voorstel,policy_uitkomst,
                 uitgevoerd,input_tokens,output_tokens,kosten_microdollar,gemaakt_op
-            ) VALUES ('besluitgroep',?,'openai','gpt-5.6-luna','1','actief','hash',
+            ) VALUES ('besluitgroep',?,'openai','gpt-6-luna','1','actief','hash',
                       ?,'besluit_goedkeuren',?,'testpolicy',?,?,?,?,?)
             """,
             (
@@ -400,6 +400,43 @@ def test_hdr10_ai_vrijgave_blijft_dicht_zonder_metadata_poort(
 
     assert response.status_code == 409
     assert "CPU en QSV" in response.text
+
+
+def test_dolby_vision_tv_vrijgave_is_bevestigd_en_zichtbaar(
+    api_case: tuple[TestClient, Database, Settings, Path],
+) -> None:
+    client, _database, _configured, _media = api_case
+    enabled = client.patch(
+        "/api/functies/dv_experimenteel",
+        json={
+            "ingeschakeld": True,
+            "configuratie": {},
+            "bevestiging": "EXPERIMENTEEL DOLBY VISION",
+        },
+    )
+    assert enabled.status_code == 200, enabled.text
+    denied = client.patch(
+        "/api/functies/dv_experimenteel",
+        json={
+            "ingeschakeld": True,
+            "configuratie": {"tv_test_geslaagd": True},
+            "bevestiging": "EXPERIMENTEEL DOLBY VISION",
+        },
+    )
+    assert denied.status_code == 409
+
+    released = client.patch(
+        "/api/functies/dv_experimenteel",
+        json={
+            "ingeschakeld": True,
+            "configuratie": {"tv_test_geslaagd": True},
+            "bevestiging": "DOLBY VISION TV-TEST GESLAAGD",
+        },
+    )
+    assert released.status_code == 200, released.text
+    state = client.get("/api/ai-controller").json()
+    assert state["dv_vrijgegeven"] is True
+    assert any("profielen 7 en 8" in item for item in state["bevoegdheden"])
 
 
 def test_dolby_vision_overzicht_toont_bronnen_voor_verificatie(

@@ -126,6 +126,8 @@ interface AiControllerState {
   reasoning: string;
   maandbudget_usd: number;
   hdr10_vrijgegeven: boolean;
+  dv_vrijgegeven: boolean;
+  geheugenherstel_ingeschakeld: boolean;
   api_sleutel_ingesteld: boolean;
   laatste_fout: string | null;
   gewijzigd_op: string;
@@ -239,6 +241,7 @@ export default function SettingsPage() {
         maandbudget_usd: Number(data.get("maandbudget_usd")),
         api_sleutel: String(data.get("api_sleutel") ?? "") || undefined,
         hdr10_vrijgegeven: data.get("hdr10_vrijgegeven") === "on",
+        geheugenherstel_ingeschakeld: data.get("geheugenherstel_ingeschakeld") === "on",
         bevestiging: String(data.get("bevestiging") ?? "") || undefined,
         hdr10_bevestiging: String(data.get("hdr10_bevestiging") ?? "") || undefined,
       });
@@ -307,6 +310,20 @@ export default function SettingsPage() {
         bevestiging: confirmation,
       });
       await load();
+    } catch (error) { setMessage(String(error)); }
+  }
+
+  async function releaseDolbyVision(feature: Feature) {
+    const confirmation = window.prompt("Typ exact: DOLBY VISION TV-TEST GESLAAGD");
+    if (confirmation === null) return;
+    try {
+      await mutation(`/functies/${feature.sleutel}`, "PATCH", {
+        ingeschakeld: true,
+        configuratie: { ...feature.configuratie, tv_test_geslaagd: true },
+        bevestiging: confirmation,
+      });
+      await load();
+      setMessage("Dolby Vision is na de TV-praktijktest volledig vrijgegeven voor ondersteunde CPU-encodes.");
     } catch (error) { setMessage(String(error)); }
   }
 
@@ -423,6 +440,7 @@ export default function SettingsPage() {
       <Field label={aiController.api_sleutel_ingesteld ? "Nieuwe API-sleutel (leeg = behouden)" : "OpenAI API-sleutel"}><input name="api_sleutel" type="password" autoComplete="new-password" /></Field>
       <Field label="Actieve-modusbevestiging"><input name="bevestiging" placeholder="AI-BEPERKTE AUTONOMIE INSCHAKELEN" autoComplete="off" /></Field>
       <label className="toggle-row"><input name="hdr10_vrijgegeven" type="checkbox" defaultChecked={aiController.hdr10_vrijgegeven} disabled={!aiController.hdr10_poort.gereed} /><span>HDR10-autonomie afzonderlijk vrijgeven</span></label>
+      <label className="toggle-row"><input name="geheugenherstel_ingeschakeld" type="checkbox" defaultChecked={aiController.geheugenherstel_ingeschakeld} /><span>Geheugenveilige AI-retry bij CPU/GPU-encoderfout</span></label>
       <Field label="HDR10-bevestiging"><input name="hdr10_bevestiging" placeholder="HDR10-METADATA-AUTONOMIE" autoComplete="off" disabled={!aiController.hdr10_poort.gereed} /></Field>
     </div><p className="muted">Typ voor actieve modus exact <span className="mono">AI-BEPERKTE AUTONOMIE INSCHAKELEN</span>. Kosten deze maand: ${aiController.verbruik.kosten_usd.toFixed(4)} van ${aiController.maandbudget_usd.toFixed(2)} · {aiController.verbruik.analyses} analyses · {aiController.verbruik.input_tokens.toLocaleString("nl-NL")} inputtokens.</p><p className="muted">Automatisch toegestaan: {aiController.bevoegdheden.join("; ")}. Altijd handmatig/geblokkeerd: {aiController.altijd_handmatig.join("; ")}.</p><p className={aiController.hdr10_poort.gereed ? "muted" : "danger"}>HDR10-poort: {aiController.hdr10_poort.gereed ? "groen" : "geblokkeerd"} · CPU {aiController.hdr10_poort.cpu.geslaagd} goed/{aiController.hdr10_poort.cpu.afwijkingen} afwijkingen · QSV {aiController.hdr10_poort.qsv.geslaagd} goed/{aiController.hdr10_poort.qsv.afwijkingen} afwijkingen. {aiController.hdr10_poort.uitleg}</p>{aiController.laatste_fout ? <p className="danger">Laatste providerfout: {aiController.laatste_fout}</p> : null}<div className="decision-actions"><Button type="submit">Versleuteld opslaan</Button><Button type="button" variant="secondary" disabled={!aiController.ingeschakeld} onClick={async () => { try { const result = await mutation<Record<string, number>>("/ai-controller/analyseer", "POST"); await load(); setMessage(`AI-controle klaar: ${JSON.stringify(result)}`); } catch (error) { setMessage(String(error)); } }}>Nu in achtergrond controleren</Button></div><p className="muted">Prijsgrens in de controller: maximaal 8.000 input- en 800 outputtokens per gegroepeerde handtekening. Providerstoring, ongeldig JSON of budgetoverschrijding voert niets uit.</p></Card></form> : null}
 
@@ -432,7 +450,7 @@ export default function SettingsPage() {
       <Field label="Bevestiging"><input name="bevestiging" placeholder="LAN-TOEGANG INSCHAKELEN" autoComplete="off" required /></Field>
     </div><p className="muted">Typ bij Bevestiging exact <span className="mono">LAN-TOEGANG INSCHAKELEN</span>. Het wachtwoord wordt direct geheugenhard gehasht en komt niet terug in de browser of logs.</p><div className="decision-actions"><Button type="submit">{lanAccess.ingeschakeld ? "Account veilig bijwerken" : "LAN-toegang inschakelen"}</Button>{lanAccess.ingeschakeld ? <Button type="button" variant="danger" onClick={disableLanAccess}>LAN-toegang uitschakelen</Button> : null}</div>{lanAccess.adressen.length ? <p className="mono muted">Open daarna op een andere computer:<br />{lanAccess.adressen.join("\n")}</p> : <p className="muted">Geen actief IPv4-netwerkadres gevonden.</p>}<p className="muted">Alleen privé-IP-adressen worden geaccepteerd. Na vijf foute aanmeldingen volgt tijdelijk een blokkade. Gebruik voor toegang vanaf internet eerst een VPN; stuur poort 3000 niet door in je router.</p>{lanAccess.laatste_fout ? <p className="danger">{lanAccess.laatste_fout}</p> : null}</Card></form> : null}
 
-    <Card className="settings-card"><h2>Onderdelen</h2><p className="muted">Uitschakelen stopt alleen nieuw werk en verwijdert niets. Kernveiligheid staat niet in deze lijst.</p><div className="feature-list">{features.filter((feature) => !["externe_toegang", "ai_controller"].includes(feature.sleutel)).map((feature) => <div className="feature-row" key={feature.sleutel}><div><strong>{feature.sleutel.replaceAll("_", " ")}</strong><p>{feature.uitleg}</p>{feature.laatste_fout ? <small className="danger">{feature.laatste_fout}</small> : null}</div><Button variant={feature.ingeschakeld ? "secondary" : "default"} aria-pressed={feature.ingeschakeld} onClick={() => toggleFeature(feature)}>{feature.ingeschakeld ? "Aan" : "Uit"}</Button></div>)}</div></Card>
+    <Card className="settings-card"><h2>Onderdelen</h2><p className="muted">Uitschakelen stopt alleen nieuw werk en verwijdert niets. Kernveiligheid staat niet in deze lijst.</p><div className="feature-list">{features.filter((feature) => !["externe_toegang", "ai_controller"].includes(feature.sleutel)).map((feature) => <div className="feature-row" key={feature.sleutel}><div><strong>{feature.sleutel.replaceAll("_", " ")}</strong><p>{feature.uitleg}</p>{feature.sleutel === "dv_experimenteel" && feature.configuratie.tv_test_geslaagd === true ? <small>TV-test geslaagd · ondersteunde DV-profielen volledig vrijgegeven</small> : null}{feature.laatste_fout ? <small className="danger">{feature.laatste_fout}</small> : null}</div><div className="decision-actions">{feature.sleutel === "dv_experimenteel" && feature.ingeschakeld && feature.configuratie.tv_test_geslaagd !== true ? <Button variant="secondary" onClick={() => releaseDolbyVision(feature)}>TV-test geslaagd: vrijgeven</Button> : null}<Button variant={feature.ingeschakeld ? "secondary" : "default"} aria-pressed={feature.ingeschakeld} onClick={() => toggleFeature(feature)}>{feature.ingeschakeld ? "Aan" : "Uit"}</Button></div></div>)}</div></Card>
 
     <Card className="settings-card"><div className="worker-header"><div><h2>Hardwarediagnose</h2><span className="muted">QSV-test en GPU-meting veranderen of resetten geen kernel-driver.</span></div><div className="decision-actions"><Button variant="secondary" onClick={async () => { try { setMessage(JSON.stringify(await mutation("/systeem/qsv-test", "POST"))); } catch (error) { setMessage(String(error)); } }}>Test QSV-verbinding</Button><Button variant="secondary" onClick={async () => setMessage(JSON.stringify(await mutation("/systeem/gpu-herstart", "POST")))}>Herstart GPU-monitor</Button><Button variant="ghost" onClick={async () => setDiagnosis(await api<Diagnosis>("/systeem/diagnose"))}>Ververs diagnose</Button></div></div>{diagnosis ? <pre>{JSON.stringify(diagnosis, null, 2)}</pre> : null}</Card>
 
